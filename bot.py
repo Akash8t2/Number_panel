@@ -23,7 +23,7 @@ YOUR_BOT_TOKEN = os.getenv("YOUR_BOT_TOKEN") # <--- This line needs to be change
 ADMIN_CHAT_IDS = os.getenv("ADMIN_CHAT_IDS", "").split(",")  # comma separated IDs # Example: ["YOUR_ADMIN_USER_ID_1", "YOUR_ADMIN_USER_ID_2"]
 # =================================================================
 # Old chat IDs kept for the first run
-INITIAL_CHAT_IDS = os.getenv("INITIAL_CHAT_IDS")
+INITIAL_CHAT_IDS = ["-1002907713631"]
 LOGIN_URL = "https://www.ivasms.com/login"
 BASE_URL = "https://www.ivasms.com/"
 SMS_API_ENDPOINT = "https://www.ivasms.com/portal/sms/received/getsms"
