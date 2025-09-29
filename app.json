@@ -1,24 +1,44 @@
 {
-  "name": "iVasms Telegram Bot",
-  "description": "Fetch SMS from ivasms and forward to Telegram",
-  "repository": "https://github.com/yourusername/ivasms-bot",
-  "keywords": ["telegram", "bot", "heroku", "httpx", "ivasms"],
+  "name": "ivasms-multi-bot",
+  "description": "Forward OTPs from multiple iVasms accounts to multiple Telegram groups (Heroku deploy).",
+  "repository": "https://github.com/yourname/ivasms-multi-bot",
+  "keywords": ["telegram", "bot", "otp", "ivasms"],
   "env": {
     "YOUR_BOT_TOKEN": {
-      "description": "Telegram Bot API Token from BotFather",
-      "required": true
-    },
-    "USERNAME": {
-      "description": "iVasms login email",
-      "required": true
-    },
-    "PASSWORD": {
-      "description": "iVasms login password",
-      "required": true
+      "description": "Telegram bot token from BotFather (required)",
+      "required": true,
+      "value": ""
     },
     "ADMIN_CHAT_IDS": {
-      "description": "Comma separated list of admin IDs",
-      "required": true
+      "description": "Comma-separated admin Telegram user IDs (e.g. 12345,67890)",
+      "value": "123456789"
+    },
+    "CHAT_IDS": {
+      "description": "Comma-separated initial Telegram chat IDs where OTPs will be sent (optional)",
+      "value": "-1003073839183"
+    },
+    "IVASMS_ACCOUNTS": {
+      "description": "JSON array of iVasms accounts (preferred). Example: [{\"username\":\"u1@mail.com\",\"password\":\"p1\"},{\"username\":\"u2@mail.com\",\"password\":\"p2\"}]",
+      "value": "[{\"username\":\"user1@example.com\",\"password\":\"pass1\"},{\"username\":\"user2@example.com\",\"password\":\"pass2\"}]"
+    },
+    "USERNAME": {
+      "description": "(optional) single iVasms username (use only if not using IVASMS_ACCOUNTS)",
+      "value": ""
+    },
+    "PASSWORD": {
+      "description": "(optional) single iVasms password (use only if not using IVASMS_ACCOUNTS)",
+      "value": ""
+    },
+    "POLLING_INTERVAL_SECONDS": {
+      "description": "How often (seconds) the bot checks iVasms (default 5)",
+      "value": "5"
     }
-  }
+  },
+  "formation": {
+    "worker": {
+      "quantity": 1,
+      "size": "Basic"
+    }
+  },
+  "stack": "heroku-22"
 }
