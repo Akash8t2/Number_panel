@@ -16,6 +16,10 @@
       "description": "iVasms login password",
       "required": true
     },
+    "INITIAL_CHAT_IDS": {
+      "description": "CHAT IDS",
+      "required": true
+    },
     "ADMIN_CHAT_IDS": {
       "description": "Comma separated list of admin IDs",
       "required": true
