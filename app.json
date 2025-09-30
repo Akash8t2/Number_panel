@@ -2,7 +2,7 @@
   "name": "otp-forwarder-bot",
   "description": "OTP Forwarder Bot - logs into dashboard, scrapes SMS and forwards to Telegram",
   "repository": "",
-  "stack": "heroku-20",
+  "stack": "heroku-24",
   "buildpacks": [
     { "url": "heroku/python" }
   ],
