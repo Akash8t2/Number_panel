@@ -1,28 +1,36 @@
 {
-  "name": "iVasms Telegram Bot",
-  "description": "Fetch SMS from ivasms and forward to Telegram",
-  "repository": "https://github.com/yourusername/ivasms-bot",
-  "keywords": ["telegram", "bot", "heroku", "httpx", "ivasms"],
+  "name": "otp-forwarder-bot",
+  "description": "OTP Forwarder Bot - Fetch OTP from website and send to Telegram",
+  "repository": "https://github.com/your-repo/otp-forwarder-bot",
   "env": {
-    "YOUR_BOT_TOKEN": {
-      "description": "Telegram Bot API Token from BotFather",
+    "BOT_TOKEN": {
+      "description": "Telegram Bot API Token from @BotFather",
       "required": true
     },
+    "CHAT_ID": {
+      "description": "Telegram Chat ID (can be group or user ID)",
+      "required": true
+    },
+    "LOGIN_URL": {
+      "description": "Website login URL",
+      "value": "http://45.82.67.20/ints/"
+    },
     "USERNAME": {
-      "description": "iVasms login email",
+      "description": "Website username",
       "required": true
     },
     "PASSWORD": {
-      "description": "iVasms login password",
+      "description": "Website password",
       "required": true
     },
-    "INITIAL_CHAT_IDS": {
-      "description": "CHAT IDS",
-      "required": true
-    },
-    "ADMIN_CHAT_IDS": {
-      "description": "Comma separated list of admin IDs",
-      "required": true
+    "SMS_URL": {
+      "description": "Website SMS Dashboard URL",
+      "value": "http://45.82.67.20/ints/agent/SMSCDRStats"
     }
-  }
+  },
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    }
+  ]
 }
