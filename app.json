@@ -1,22 +1,24 @@
 {
   "name": "otp-forwarder-bot",
-  "description": "OTP Forwarder Bot - logs into dashboard, scrapes SMS and forwards to Telegram",
+  "description": "Forward OTPs from IMS SMS Dashboard (45.82.67.20) to Telegram chats. Logs in, solves simple math captcha, polls JSON API and forwards OTPs.",
   "repository": "",
-  "stack": "heroku-24",
+  "stack": "heroku-20",
   "buildpacks": [
-    { "url": "heroku/python" }
+    {
+      "url": "heroku/python"
+    }
   ],
   "env": {
     "BOT_TOKEN": {
-      "description": "Telegram Bot token from @BotFather (format: 123456:ABCDEF...)",
+      "description": "Telegram Bot Token (from @BotFather). Example: 123456:ABCdef...",
       "required": true
     },
     "CHAT_IDS": {
-      "description": "Comma-separated Telegram chat IDs or group IDs (e.g. -100123...,12345)",
+      "description": "Comma-separated Telegram chat IDs (groups or users). Example: -100123...,987654321",
       "required": true
     },
     "USERNAME": {
-      "description": "Website login username",
+      "description": "Website login username for http://45.82.67.20",
       "required": true
     },
     "PASSWORD": {
@@ -24,45 +26,56 @@
       "required": true
     },
     "SITE_BASE": {
-      "description": "Base URL of site",
+      "description": "Base URL of the SMS dashboard site",
       "value": "http://45.82.67.20"
     },
+    "LOGIN_PATH": {
+      "description": "Path to login page (relative to SITE_BASE)",
+      "value": "/ints/login"
+    },
+    "SIGNIN_PATH": {
+      "description": "Path to signin POST (relative to SITE_BASE)",
+      "value": "/ints/signin"
+    },
     "DASH_PATH": {
-      "description": "Path to dashboard page",
+      "description": "Dashboard path used as referer",
       "value": "/ints/agent/SMSDashboard"
     },
-    "CDR_PATH": {
-      "description": "Path to CDR/SMS stats page",
-      "value": "/ints/agent/SMSCDRStats"
-    },
-    "LOGIN_PATH": {
-      "description": "Path to login page (optional)",
-      "value": "/ints/agent/login"
+    "DATA_API_PATH": {
+      "description": "JSON data endpoint path",
+      "value": "/ints/agent/res/data_smscdr.php"
     },
     "POLL_INTERVAL": {
-      "description": "Seconds between polls",
+      "description": "Seconds between polls of the JSON API",
       "value": "6"
     },
     "STATE_FILE": {
-      "description": "Filename to persist processed ids",
+      "description": "Filename for persisting processed IDs in the dyno filesystem",
       "value": "processed_sms_ids.json"
     },
-    "MAX_SEEN": {
-      "description": "Max number of seen IDs to keep in memory",
-      "value": "20000"
+    "REQUEST_TIMEOUT": {
+      "description": "Seconds for HTTP request timeouts",
+      "value": "15"
     },
     "USER_AGENT": {
       "description": "User-Agent header used for requests",
       "value": "Mozilla/5.0 (X11; Linux x86_64)"
     },
-    "REQUEST_TIMEOUT": {
-      "description": "HTTP request timeout in seconds",
-      "value": "15"
+    "SESSION_VALIDATE_INTERVAL": {
+      "description": "Seconds between session validation probes (reduce repeated logins)",
+      "value": "60"
+    },
+    "LOGIN_MIN_INTERVAL": {
+      "description": "Minimum seconds between login attempts (backoff)",
+      "value": "5"
     }
   },
   "formation": {
     "worker": {
       "quantity": 1
     }
+  },
+  "scripts": {
+    "postdeploy": "echo 'Deployed OTP Forwarder. Set BOT_TOKEN, CHAT_IDS, USERNAME and PASSWORD as config vars.'"
   }
 }
