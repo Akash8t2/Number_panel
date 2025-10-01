@@ -1,20 +1,30 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-otp_forwarder_complete.py
-- Login: GET /ints/login -> solve simple math captcha -> POST /ints/signin
-- Fetch JSON: /ints/agent/res/data_smscdr.php
-- Parse aaData rows -> extract OTP -> send to Telegram chats
-- Persistent dedupe (STATE_FILE)
-"""
+# bot.py -- Robust OTP forwarder for 45.82.67.20 -> Telegram
+# Usage: set env vars then run
+# Required ENV:
+#   BOT_TOKEN       -> Telegram bot token
+#   CHAT_IDS        -> comma-separated chat ids (where OTPs will be sent)
+#   USERNAME        -> site username
+#   PASSWORD        -> site password
+# Optional ENV:
+#   ADMIN_CHAT_IDS  -> comma-separated admin chat ids for alerts (optional)
+#   SITE_BASE (default http://45.82.67.20)
+#   POLL_INTERVAL (default 6 seconds)
+#   KEEPALIVE_INTERVAL (default 300 seconds)
+#   STATE_FILE (default processed_sms_ids.json)
+#   REQUEST_TIMEOUT (default 15)
+#   LOGIN_MIN_INTERVAL (default 5)
+#   MAX_RELOGIN_TRIES (default 6)
+# Requirements:
+#   pip install requests beautifulsoup4 phonenumbers pycountry
 
 import os
 import time
 import json
 import logging
-import re
 import random
 import string
+import re
 from datetime import datetime, timedelta
 from hashlib import sha1
 from typing import Optional
@@ -24,9 +34,10 @@ from bs4 import BeautifulSoup
 import phonenumbers
 import pycountry
 
-# ---------------- CONFIG (env) ----------------
+# ---------------- CONFIG ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_IDS = os.getenv("CHAT_IDS", "")        # comma separated chat IDs
+CHAT_IDS = os.getenv("CHAT_IDS", "")
+ADMIN_CHAT_IDS = os.getenv("ADMIN_CHAT_IDS", "")  # optional alerts
 USERNAME = os.getenv("USERNAME")
 PASSWORD = os.getenv("PASSWORD")
 
@@ -36,9 +47,13 @@ SIGNIN_PATH = os.getenv("SIGNIN_PATH", "/ints/signin")
 DASH_PATH = os.getenv("DASH_PATH", "/ints/agent/SMSDashboard")
 DATA_API_PATH = os.getenv("DATA_API_PATH", "/ints/agent/res/data_smscdr.php")
 
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "6"))   # seconds
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "6"))
+KEEPALIVE_INTERVAL = int(os.getenv("KEEPALIVE_INTERVAL", "300"))
 STATE_FILE = os.getenv("STATE_FILE", "processed_sms_ids.json")
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "15"))
+LOGIN_MIN_INTERVAL = int(os.getenv("LOGIN_MIN_INTERVAL", "5"))
+MAX_RELOGIN_TRIES = int(os.getenv("MAX_RELOGIN_TRIES", "6"))
+
 USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (X11; Linux x86_64)")
 
 # ---------------- derived ----------------
@@ -50,13 +65,14 @@ DASH_URL = SITE_BASE + DASH_PATH
 DATA_API_URL = SITE_BASE + DATA_API_PATH
 
 CHAT_IDS_LIST = [c.strip() for c in CHAT_IDS.split(",") if c.strip()]
+ADMIN_CHAT_IDS_LIST = [c.strip() for c in ADMIN_CHAT_IDS.split(",") if c.strip()]
 TELEGRAM_API_SEND = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
 # ---------------- logging ----------------
 logging.basicConfig(format="%(asctime)s %(levelname)s: %(message)s", level=logging.INFO)
-logger = logging.getLogger("otp_forwarder_complete")
+logger = logging.getLogger("otp_forwarder")
 
-# ---------------- state helpers ----------------
+# ---------------- state ----------------
 def load_seen() -> set:
     if not os.path.exists(STATE_FILE):
         return set()
@@ -67,22 +83,22 @@ def load_seen() -> set:
     except Exception:
         return set()
 
-def save_seen(seen_set: set):
+def save_seen(s: set):
     try:
         with open(STATE_FILE, "w") as f:
-            json.dump(list(seen_set), f)
+            json.dump(list(s), f)
     except Exception as e:
-        logger.warning("Could not save state file: %s", e)
+        logger.warning("Failed to save state file: %s", e)
 
 seen = load_seen()
 
-# ---------------- regex/helpers ----------------
+# ---------------- helpers ----------------
 OTP_HYPH = re.compile(r'(\d{3}-\d{3})')
 OTP_PLAIN = re.compile(r'\b(\d{3,8})\b')
 DIGITS = re.compile(r'\d+')
 
-def random_tail(n=10):
-    return ''.join(random.choices(string.ascii_letters + string.digits, k=n))
+def random_tail(n=10) -> str:
+    return ''.join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=n))
 
 def detect_service(text: str) -> str:
     if not text: return "Unknown"
@@ -93,44 +109,84 @@ def detect_service(text: str) -> str:
     if "facebook" in t: return "Facebook"
     return "Unknown"
 
-def get_country(number: str) -> str:
-    if not number: return "Unknown"
-    candidates = [number]
-    if not number.startswith("+"):
-        candidates.insert(0, "+" + number)
+def country_from_number(num: str) -> str:
+    if not num: return "Unknown"
+    candidates = [num]
+    if not num.startswith("+"):
+        candidates.insert(0, "+" + num)
     for n in candidates:
         try:
-            pn = phonenumbers.parse(n, None)
-            region = phonenumbers.region_code_for_number(pn)
+            parsed = phonenumbers.parse(n, None)
+            region = phonenumbers.region_code_for_number(parsed)
             if region:
-                c = pycountry.countries.get(alpha_2=region)
-                if c: return c.name
+                country = pycountry.countries.get(alpha_2=region)
+                if country:
+                    return country.name
         except Exception:
             continue
     return "Unknown"
 
+def format_for_telegram(entry: dict) -> str:
+    number = entry.get("number", "N/A")
+    code = entry.get("code", "N/A")
+    service = entry.get("service", "Unknown")
+    country = entry.get("country", "Unknown")
+    ts = entry.get("time", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+    msg = entry.get("message", "")
+    code_plain = entry.get("code_plain", code)
+    tail = random_tail(10)
+    login_link = ""
+    if ("telegram" in service.lower() or "telegram" in (msg or "").lower()) and code_plain not in (None, "N/A"):
+        login_link = f"\nYou can also tap on this link to log in:\nhttps://t.me/login/{code_plain}\n"
+
+    text = (
+        "˹𝐕𝐢𝐛𝐞ꭙ 𝐅ʟ𝐨𝐰™ ˼:\n"
+        "🔔 You have successfully received OTP\n\n"
+        f"📞 Number: {number}\n"
+        f"🔑 Code: {code}\n"
+        f"🏆 Service: {service}\n"
+        f"🌎 Country: {country}\n"
+        f"⏳ Time: {ts}\n\n"
+        "💬 Message:\n"
+        f"{msg}\n"
+        f"{login_link}"
+        f"{tail}"
+    )
+    return text
+
+def send_telegram(chat_id: str, text: str):
+    try:
+        r = requests.post(TELEGRAM_API_SEND, data={"chat_id": chat_id, "text": text}, timeout=10)
+        if r.status_code != 200:
+            logger.warning("Telegram send failed for %s: %s %s", chat_id, r.status_code, r.text[:200])
+    except Exception as e:
+        logger.exception("Telegram send error for %s: %s", chat_id, e)
+
+def alert_admins(msg: str):
+    for cid in ADMIN_CHAT_IDS_LIST:
+        try:
+            send_telegram(cid, f"[ALERT] {msg}")
+        except Exception:
+            pass
+
 # ---------------- session & login ----------------
 session: Optional[requests.Session] = None
-_last_login = 0
-LOGIN_MIN_INTERVAL = 5
+_last_login_ts = 0
+_last_keepalive = 0
 
-def compute_math_from_text(text: str) -> Optional[str]:
-    """Try to find a simple math pair and return their sum as string."""
-    if not text:
+def compute_math_answer_from_html(html: str) -> Optional[str]:
+    # find arithmetic or first two numbers
+    if not html:
         return None
-    # look for expressions with operator
-    m = re.search(r'(-?\d+)\s*([+\-xX*\/])\s*(-?\d+)', text)
+    # try arithmetic
+    m = re.search(r'(-?\d+)\s*([+\-xX*\/])\s*(-?\d+)', html)
     if m:
         a, op, b = int(m.group(1)), m.group(2), int(m.group(3))
-        try:
-            if op in ['+', '＋']: return str(a + b)
-            if op in ['-', '−', '–']: return str(a - b)
-            if op in ['x','X','*','×']: return str(a * b)
-            if op == '/': return str(a // b if b != 0 else 0)
-        except Exception:
-            return None
-    # fallback: first two digits found
-    nums = DIGITS.findall(text)
+        if op in ('+', '＋'): return str(a + b)
+        if op in ('-', '−', '–'): return str(a - b)
+        if op in ('x', 'X', '*', '×'): return str(a * b)
+        if op == '/': return str(a // b if b != 0 else 0)
+    nums = DIGITS.findall(html)
     if len(nums) >= 2:
         try:
             return str(int(nums[0]) + int(nums[1]))
@@ -138,21 +194,23 @@ def compute_math_from_text(text: str) -> Optional[str]:
             return None
     return None
 
-def login_session() -> Optional[requests.Session]:
-    """Create and return an authenticated session (or None)."""
-    global session, _last_login
+def login_session(force: bool = False) -> Optional[requests.Session]:
+    """Create session and login. Throttled by LOGIN_MIN_INTERVAL."""
+    global session, _last_login_ts
     now = time.time()
-    if now - _last_login < LOGIN_MIN_INTERVAL:
-        logger.debug("Login throttled.")
+    if not force and now - _last_login_ts < LOGIN_MIN_INTERVAL and session:
         return session
-    _last_login = now
+    _last_login_ts = now
 
     if not USERNAME or not PASSWORD:
-        logger.error("USERNAME or PASSWORD not set.")
+        logger.error("USERNAME/PASSWORD not set in env.")
         return None
 
     s = requests.Session()
-    s.headers.update({"User-Agent": USER_AGENT, "Referer": SITE_BASE})
+    s.headers.update({
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    })
 
     try:
         r = s.get(LOGIN_URL, timeout=REQUEST_TIMEOUT)
@@ -160,26 +218,15 @@ def login_session() -> Optional[requests.Session]:
         logger.warning("GET login failed: %s", e)
         return None
 
-    page_text = r.text or ""
+    html = r.text or ""
     # compute captcha
-    answer = compute_math_from_text(page_text)
-    if answer is None:
-        nums = DIGITS.findall(page_text)
-        if len(nums) >= 2:
-            try:
-                answer = str(int(nums[0]) + int(nums[1]))
-            except Exception:
-                answer = None
-
-    if answer is None:
-        logger.warning("Could not find/solve math captcha on login page. Snippet: %s", (page_text[:200].replace("\n"," ")))
+    ans = compute_math_answer_from_html(html)
+    if ans is None:
+        # log snippet for debugging
+        logger.warning("Could not find math captcha on login page. Snippet: %s", (html[:300].replace("\n"," ")))
         return None
 
-    payload = {
-        "username": USERNAME,
-        "password": PASSWORD,
-        "capt": answer
-    }
+    payload = {"username": USERNAME, "password": PASSWORD, "capt": ans}
     headers = {
         "User-Agent": USER_AGENT,
         "Referer": LOGIN_URL,
@@ -193,56 +240,59 @@ def login_session() -> Optional[requests.Session]:
         logger.warning("Login POST failed: %s", e)
         return None
 
-    lower = (post.text or "").lower()
+    low = (post.text or "").lower()
     # heuristics for success
-    if "logout" in lower or ("/login" not in post.url.lower() and post.status_code in (200, 302, 303)):
+    if ("logout" in low) or ("/login" not in post.url.lower() and post.status_code in (200, 302, 303)):
         session = s
-        logger.info("Login appears successful.")
+        logger.info("Login appears successful (post -> %s)", post.url)
         return session
-    # verify by fetching dashboard
+
+    # try fetch dashboard to verify
     try:
         chk = s.get(DASH_URL, timeout=REQUEST_TIMEOUT)
         chk_text = (chk.text or "").lower()
         if chk.status_code < 400 and ("sms" in chk_text or "dashboard" in chk_text or "received" in chk_text):
             session = s
-            logger.info("Login confirmed via dashboard.")
+            logger.info("Login confirmed via dashboard fetch.")
             return session
     except Exception:
         pass
 
-    logger.warning("Login not confirmed. Snippet: %s", ((post.text or "")[:300].replace("\n"," ")))
+    # failed: log snippet
+    snippet = (post.text or "")[:400].replace("\n", " ")
+    logger.warning("Login not confirmed. Snippet: %s", snippet)
     return None
 
 def ensure_session() -> Optional[requests.Session]:
-    """Return a usable session (login if needed)."""
-    global session
+    global session, _last_keepalive
+    # if no session, login
     if session is None:
-        session = login_session()
-    else:
-        # probe data API quickly to ensure not redirected
+        return login_session()
+    # keepalive to refresh cookie
+    now = time.time()
+    if now - _last_keepalive > KEEPALIVE_INTERVAL:
         try:
-            r = session.get(DATA_API_URL, params={"_": int(time.time()*1000)}, timeout=REQUEST_TIMEOUT)
+            r = session.get(DASH_URL, timeout=REQUEST_TIMEOUT)
+            _last_keepalive = now
             body = (r.text or "").lower()
             if r.status_code >= 400 or ("username" in body and "password" in body) or ("what is" in body and "?" in body):
-                logger.info("Session invalid according to probe; re-login.")
+                logger.info("Keepalive indicates session expired. Re-login.")
                 try:
                     session.close()
                 except Exception:
                     pass
-                session = login_session()
-        except Exception:
-            logger.info("Session probe failed; re-login.")
+                session = login_session(force=True)
+        except Exception as e:
+            logger.info("Keepalive probe failed: %s. Re-login.", e)
             try:
                 session.close()
             except Exception:
                 pass
-            session = login_session()
+            session = login_session(force=True)
     return session
 
-# ---------------- data fetch & parse ----------------
-def fetch_json_rows() -> Optional[list]:
-    """Return aaData list or None."""
-    # params: last 24 hours by default
+# ---------------- data API ----------------
+def fetch_rows() -> Optional[list]:
     now = datetime.utcnow()
     fdate2 = now.strftime("%Y-%m-%d %H:%M:%S")
     fdate1 = (now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
@@ -274,7 +324,7 @@ def fetch_json_rows() -> Optional[list]:
     }
 
     s = ensure_session()
-    tried = False
+    tried_relogin = False
     for attempt in range(2):
         try:
             if s:
@@ -283,44 +333,47 @@ def fetch_json_rows() -> Optional[list]:
                 r = requests.get(DATA_API_URL, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
         except Exception as e:
             logger.warning("Data API request attempt %d failed: %s", attempt+1, e)
-            if s and not tried:
-                tried = True
-                s = login_session()
+            if s and not tried_relogin:
+                tried_relogin = True
+                s = login_session(force=True)
                 continue
             return None
 
         body = r.text or ""
         lower = body.lower()
-        # detect HTML login page
-        if ("username" in lower and "password" in lower) or ("what is" in lower and "?" in lower) or ("<html" in lower and "login" in lower):
-            snippet = (body[:300].replace("\n"," ") if body else "")
-            logger.info("Data API returned login/html page snippet: %s", snippet)
-            if not tried:
-                tried = True
-                s = login_session()
-                continue
-            return None
 
+        # Detect HTML/login page
+        if ("<html" in lower and "login" in lower) or ("username" in lower and "password" in lower) or ("what is" in lower and "?" in lower):
+            snippet = (body[:300].replace("\n"," ") if body else "")
+            logger.info("Data API returned login/html page snippet: %s", snippet[:200])
+            # re-login once then retry
+            if not tried_relogin:
+                tried_relogin = True
+                s = login_session(force=True)
+                continue
+            else:
+                return None
+
+        # Try parse JSON
         try:
             data = r.json()
             aa = data.get("aaData", [])
             return aa
         except Exception:
-            # fallback: try to extract braces region
+            # try to salvage JSON inside body
             start = body.find("{"); end = body.rfind("}") + 1
             if start != -1 and end != -1:
                 try:
                     data = json.loads(body[start:end])
                     return data.get("aaData", [])
                 except Exception:
-                    logger.exception("JSON parse failed after trim")
+                    logger.exception("Failed parsing JSON after trimming")
                     return None
-            logger.warning("Data API returned non-JSON response.")
+            logger.warning("Data API returned non-JSON content but not login page.")
             return None
     return None
 
-def parse_row_to_entry(row: list) -> Optional[dict]:
-    """Map row -> dict with id, time, number, service, message, code, country."""
+def parse_row(row: list) -> Optional[dict]:
     try:
         ts = row[0] if len(row) > 0 else ""
         operator = row[1] if len(row) > 1 else ""
@@ -332,20 +385,16 @@ def parse_row_to_entry(row: list) -> Optional[dict]:
         return None
 
     number = number.strip()
-    # otp extraction
     m = OTP_HYPH.search(message)
     if m:
-        code = m.group(1)
-        code_plain = code.replace("-", "")
+        code = m.group(1); code_plain = code.replace("-", "")
     else:
         m2 = OTP_PLAIN.search(message)
         code = m2.group(1) if m2 else "N/A"
         code_plain = code
 
-    # service detection preference: service_field if meaningful else message
     service_guess = str(service_field).strip() if service_field and str(service_field).strip() not in ("", "0", "-") else detect_service(message)
-
-    country = get_country(number)
+    country = country_from_number(number)
     uid_src = f"{number}|{message}|{ts}"
     uid = sha1(uid_src.encode("utf-8")).hexdigest()
 
@@ -362,88 +411,73 @@ def parse_row_to_entry(row: list) -> Optional[dict]:
         "country": country
     }
 
-# ---------------- format & send ----------------
-def format_message(entry: dict) -> str:
-    number = entry.get("number", "N/A")
-    code = entry.get("code", "N/A")
-    service = entry.get("service", "Unknown")
-    country = entry.get("country", "Unknown")
-    ts = entry.get("time", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
-    msg = entry.get("message", "")
-    tail = random_tail(10)
-
-    login_link = ""
-    if ("telegram" in service.lower() or "telegram" in (msg or "").lower()) and entry.get("code_plain") not in (None, "N/A"):
-        login_link = f"\nYou can also tap on this link to log in:\nhttps://t.me/login/{entry.get('code_plain')}\n"
-
-    text = (
-        "˹𝐕𝐢𝐛𝐞ꭙ 𝐅ʟ𝐨𝐰™ ˼:\n"
-        "🔔 You have successfully received OTP\n\n"
-        f"📞 Number: {number}\n"
-        f"🔑 Code: {code}\n"
-        f"🏆 Service: {service}\n"
-        f"🌎 Country: {country}\n"
-        f"⏳ Time: {ts}\n\n"
-        "💬 Message:\n"
-        f"{msg}\n"
-    )
-    return text
-
-def send_telegram_to_all(text: str):
-    for cid in CHAT_IDS_LIST:
-        try:
-            resp = requests.post(TELEGRAM_API_SEND, data={"chat_id": cid, "text": text}, timeout=10)
-            if resp.status_code != 200:
-                logger.warning("Telegram send failed for %s: %s %s", cid, resp.status_code, resp.text[:200])
-        except Exception as e:
-            logger.exception("Error sending to Telegram for %s: %s", cid, e)
-
 # ---------------- main loop ----------------
-def poll_cycle():
-    aa = fetch_json_rows()
+def poll_once():
+    aa = fetch_rows()
     if not aa:
         logger.debug("No rows returned this cycle.")
         return
-    # aa is list of rows; they are usually sorted newest-first
-    # process oldest-first for meaningful order
+    # process oldest-first
     for row in reversed(aa):
-        entry = parse_row_to_entry(row)
+        entry = parse_row(row)
         if not entry:
             continue
         uid = entry.get("id")
         if not uid or uid in seen:
             continue
         seen.add(uid)
-        text = format_message(entry)
+        text = format_for_telegram(entry)
         logger.info("Forwarding OTP id=%s number=%s code=%s", uid[:8], entry.get("number"), entry.get("code"))
-        send_telegram_to_all(text)
-        time.sleep(0.15)
+        for cid in CHAT_IDS_LIST:
+            send_telegram(cid, text)
+            time.sleep(0.12)
     if aa:
         save_seen(seen)
 
-def main():
-    logger.info("Starting OTP forwarder (complete).")
-    # validations
+def run():
+    # basic validation
     if not BOT_TOKEN or not CHAT_IDS_LIST:
-        logger.error("BOT_TOKEN and CHAT_IDS env vars required. Exiting.")
+        logger.error("BOT_TOKEN and CHAT_IDS env vars are required. Exiting.")
         raise SystemExit(1)
     if not USERNAME or not PASSWORD:
-        logger.error("USERNAME and PASSWORD env vars required for login. Exiting.")
+        logger.error("USERNAME and PASSWORD env vars are required. Exiting.")
         raise SystemExit(1)
 
-    # initial login
-    ensure_session()
+    # attempt initial login, with retries and admin alert on repeated failure
+    relogin_tries = 0
+    while True:
+        s = login_session()
+        if s:
+            logger.info("Initial login successful.")
+            break
+        relogin_tries += 1
+        logger.warning("Initial login attempt %d failed.", relogin_tries)
+        if relogin_tries >= MAX_RELOGIN_TRIES:
+            alert_admins(f"OTP forwarder failed to login after {relogin_tries} attempts. Check credentials / site.")
+            logger.error("Giving up after %d failed login attempts.", relogin_tries)
+            time.sleep(60)
+            relogin_tries = 0
+        time.sleep(min(10 * relogin_tries, 60))
 
+    # main loop
     try:
+        last_keepalive = time.time()
         while True:
             try:
-                poll_cycle()
+                poll_once()
             except Exception:
-                logger.exception("Unhandled exception in poll cycle.")
+                logger.exception("Unhandled error in poll cycle.")
+            # keepalive: occasionally hit dashboard to refresh session
+            if time.time() - last_keepalive > KEEPALIVE_INTERVAL:
+                try:
+                    s = ensure_session()
+                    last_keepalive = time.time()
+                except Exception:
+                    logger.exception("Keepalive check failed.")
             time.sleep(POLL_INTERVAL)
     except KeyboardInterrupt:
-        logger.info("Interrupted by user; saving state.")
+        logger.info("Interrupted by user, saving state.")
         save_seen(seen)
 
 if __name__ == "__main__":
-    main()
+    run()
