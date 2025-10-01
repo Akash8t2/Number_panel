@@ -1,65 +1,63 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-otp_forwarder_login_json.py
-
-- Logs into the dashboard (handles simple math captcha)
-- Calls JSON endpoint /ints/agent/res/data_smscdr.php to fetch aaData rows
-- Parses OTP, service, country, time, number and forwards to Telegram with
-  iVasms-like formatting.
+otp_forwarder_complete.py
+- Login: GET /ints/login -> solve simple math captcha -> POST /ints/signin
+- Fetch JSON: /ints/agent/res/data_smscdr.php
+- Parse aaData rows -> extract OTP -> send to Telegram chats
+- Persistent dedupe (STATE_FILE)
 """
 
 import os
 import time
 import json
 import logging
-import requests
 import re
 import random
 import string
 from datetime import datetime, timedelta
 from hashlib import sha1
-from urllib.parse import urljoin, urlencode
+from typing import Optional
 
+import requests
 from bs4 import BeautifulSoup
 import phonenumbers
 import pycountry
 
-# ---------------- CONFIG (from env) ----------------
-BOT_TOKEN = os.getenv("BOT_TOKEN")                # required
-CHAT_IDS = os.getenv("CHAT_IDS", "")              # required, comma-separated
-USERNAME = os.getenv("USERNAME")                  # required for login
-PASSWORD = os.getenv("PASSWORD")                  # required for login
+# ---------------- CONFIG (env) ----------------
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_IDS = os.getenv("CHAT_IDS", "")        # comma separated chat IDs
+USERNAME = os.getenv("USERNAME")
+PASSWORD = os.getenv("PASSWORD")
 
 SITE_BASE = os.getenv("SITE_BASE", "http://45.82.67.20")
-LOGIN_PATH = os.getenv("LOGIN_PATH", "/ints/")   # default root where login form lives
+LOGIN_PATH = os.getenv("LOGIN_PATH", "/ints/login")
+SIGNIN_PATH = os.getenv("SIGNIN_PATH", "/ints/signin")
 DASH_PATH = os.getenv("DASH_PATH", "/ints/agent/SMSDashboard")
-CDR_PATH = os.getenv("CDR_PATH", "/ints/agent/SMSCDRStats")
 DATA_API_PATH = os.getenv("DATA_API_PATH", "/ints/agent/res/data_smscdr.php")
 
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "6"))  # seconds between polls
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "6"))   # seconds
 STATE_FILE = os.getenv("STATE_FILE", "processed_sms_ids.json")
-MAX_SEEN = int(os.getenv("MAX_SEEN", "20000"))
-USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (X11; Linux x86_64)")
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "15"))
+USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (X11; Linux x86_64)")
 
 # ---------------- derived ----------------
 if SITE_BASE.endswith("/"):
     SITE_BASE = SITE_BASE[:-1]
-LOGIN_URL = urljoin(SITE_BASE + "/", LOGIN_PATH.lstrip("/"))
-DASH_URL = urljoin(SITE_BASE + "/", DASH_PATH.lstrip("/"))
-CDR_URL = urljoin(SITE_BASE + "/", CDR_PATH.lstrip("/"))
-DATA_API_URL = urljoin(SITE_BASE + "/", DATA_API_PATH.lstrip("/"))
+LOGIN_URL = SITE_BASE + LOGIN_PATH
+SIGNIN_URL = SITE_BASE + SIGNIN_PATH
+DASH_URL = SITE_BASE + DASH_PATH
+DATA_API_URL = SITE_BASE + DATA_API_PATH
 
 CHAT_IDS_LIST = [c.strip() for c in CHAT_IDS.split(",") if c.strip()]
 TELEGRAM_API_SEND = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
 # ---------------- logging ----------------
 logging.basicConfig(format="%(asctime)s %(levelname)s: %(message)s", level=logging.INFO)
-logger = logging.getLogger("otp_forwarder_json")
+logger = logging.getLogger("otp_forwarder_complete")
 
 # ---------------- state helpers ----------------
-def load_seen():
+def load_seen() -> set:
     if not os.path.exists(STATE_FILE):
         return set()
     try:
@@ -69,7 +67,7 @@ def load_seen():
     except Exception:
         return set()
 
-def save_seen(seen_set):
+def save_seen(seen_set: set):
     try:
         with open(STATE_FILE, "w") as f:
             json.dump(list(seen_set), f)
@@ -78,297 +76,176 @@ def save_seen(seen_set):
 
 seen = load_seen()
 
-# ---------------- regex / small helpers ----------------
-PHONE_RE = re.compile(r'(\+?\d{6,15})')
-# we will accept hyphenated or plain numeric codes, 3-8 digits
-OTP_RE_HYPHEN = re.compile(r'(\d{3}-\d{3})')
-OTP_RE_PLAIN = re.compile(r'\b(\d{3,8})\b')
+# ---------------- regex/helpers ----------------
+OTP_HYPH = re.compile(r'(\d{3}-\d{3})')
+OTP_PLAIN = re.compile(r'\b(\d{3,8})\b')
+DIGITS = re.compile(r'\d+')
 
-def random_tail(length=10):
-    return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
+def random_tail(n=10):
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=n))
 
-# ---------------- service & country detection ----------------
-SERVICE_MAP_KEYWORDS = {
-    "Telegram": ["telegram"],
-    "WhatsApp": ["whatsapp", "whats app"],
-    "Facebook": ["facebook", "fb"],
-    "Google": ["google", "gmail", "gsuite"],
-    "Instagram": ["instagram"],
-    "Gmail": ["gmail"],
-    "Netflix": ["netflix"],
-    "Amazon": ["amazon"],
-    "PayPal": ["paypal"],
-    "Twitter": ["twitter", "x "],
-    "Steam": ["steam"]
-}
-SERVICE_EMOJIS = {
-    "Telegram": "📩", "WhatsApp": "💚", "Facebook": "📘", "Google": "🔍", "Instagram": "📷",
-    "Gmail": "✉️", "Netflix": "🎬", "Amazon": "🛒", "PayPal": "💰", "Twitter": "🐦", "Unknown": "❓"
-}
-
-def detect_service_from_text(text):
-    if not text:
-        return "Unknown"
-    low = text.lower()
-    for name, keys in SERVICE_MAP_KEYWORDS.items():
-        for k in keys:
-            if k in low:
-                return name
+def detect_service(text: str) -> str:
+    if not text: return "Unknown"
+    t = text.lower()
+    if "whatsapp" in t: return "WhatsApp"
+    if "telegram" in t: return "Telegram"
+    if "gmail" in t or "google" in t: return "Gmail"
+    if "facebook" in t: return "Facebook"
     return "Unknown"
 
-def get_country_from_number(number):
-    if not number:
-        return "Unknown"
-    # ensure we try with leading + if not present
-    test_nums = [number]
+def get_country(number: str) -> str:
+    if not number: return "Unknown"
+    candidates = [number]
     if not number.startswith("+"):
-        test_nums.insert(0, "+" + number)
-    for num in test_nums:
+        candidates.insert(0, "+" + number)
+    for n in candidates:
         try:
-            parsed = phonenumbers.parse(num, None)
-            region = phonenumbers.region_code_for_number(parsed)
+            pn = phonenumbers.parse(n, None)
+            region = phonenumbers.region_code_for_number(pn)
             if region:
-                country = pycountry.countries.get(alpha_2=region)
-                if country:
-                    return country.name
+                c = pycountry.countries.get(alpha_2=region)
+                if c: return c.name
         except Exception:
             continue
     return "Unknown"
 
-# ---------------- login / session with math-captcha solver ----------------
-session = None
-_last_login_attempt = 0
-LOGIN_MIN_INTERVAL = 5  # seconds between login attempts to avoid hammering
+# ---------------- session & login ----------------
+session: Optional[requests.Session] = None
+_last_login = 0
+LOGIN_MIN_INTERVAL = 5
 
-def compute_simple_math_answer(text):
-    """Parse simple math in text like 'What is 1 + 0 = ?' or 'What is 4 + 8 = ?'"""
+def compute_math_from_text(text: str) -> Optional[str]:
+    """Try to find a simple math pair and return their sum as string."""
     if not text:
         return None
-    # Common patterns: '1 + 0', '4 + 8 = ?', 'What is 1 + 0 = ?'
+    # look for expressions with operator
     m = re.search(r'(-?\d+)\s*([+\-xX*\/])\s*(-?\d+)', text)
     if m:
-        a = int(m.group(1))
-        op = m.group(2)
-        b = int(m.group(3))
+        a, op, b = int(m.group(1)), m.group(2), int(m.group(3))
         try:
-            if op in ['+', '＋']:
-                return str(a + b)
-            if op in ['-', '−', '–']:
-                return str(a - b)
-            if op in ['x', 'X', '*', '×']:
-                return str(a * b)
-            if op == '/':
-                return str(a // b if b != 0 else 0)
+            if op in ['+', '＋']: return str(a + b)
+            if op in ['-', '−', '–']: return str(a - b)
+            if op in ['x','X','*','×']: return str(a * b)
+            if op == '/': return str(a // b if b != 0 else 0)
         except Exception:
             return None
-    m2 = re.search(r'(\d+)\s*\+\s*(\d+)', text)
-    if m2:
-        return str(int(m2.group(1)) + int(m2.group(2)))
+    # fallback: first two digits found
+    nums = DIGITS.findall(text)
+    if len(nums) >= 2:
+        try:
+            return str(int(nums[0]) + int(nums[1]))
+        except Exception:
+            return None
     return None
 
-def discover_form_fields(form):
-    """
-    Inspect a BeautifulSoup form and try to find username, password, captcha and token.
-    Returns names: username_field, password_field, captcha_field, token_field_name, token_value, action_url
-    """
-    inputs = form.find_all("input")
-    username_field = None
-    password_field = None
-    captcha_field = None
-    token_field = None
-    token_value = None
-
-    for inp in inputs:
-        name = inp.get("name")
-        itype = (inp.get("type") or "").lower()
-        placeholder = (inp.get("placeholder") or "").lower()
-        if not username_field:
-            if itype in ("text", "email") or (name and any(k in (name or "").lower() for k in ("user", "email", "username")) ) or ("username" in placeholder):
-                username_field = name
-        if not password_field:
-            if itype == "password" or (name and "pass" in (name or "").lower()):
-                password_field = name
-        # token detection
-        if name and ("_token" in name.lower() or "csrf" in name.lower() or name.lower().startswith("token")):
-            token_field = name
-            if inp.get("value"):
-                token_value = inp.get("value")
-        # captcha detection heuristics
-        if not captcha_field and name:
-            lname = (name or "").lower()
-            if "captcha" in lname or "answer" in lname or "math" in lname or "security" in lname:
-                captcha_field = name
-        if not captcha_field and placeholder and ("?" in placeholder or "answer" in placeholder):
-            captcha_field = name
-
-    # fallback to first text input for username and first password for password if not found
-    if not username_field:
-        for inp in inputs:
-            if (inp.get("type") or "").lower() in ("text", "email"):
-                username_field = inp.get("name")
-                break
-    if not password_field:
-        for inp in inputs:
-            if (inp.get("type") or "").lower() == "password":
-                password_field = inp.get("name")
-                break
-
-    action = form.get("action") or ""
-    return username_field, password_field, captcha_field, token_field, token_value, action
-
-def create_logged_session():
-    """Attempt to login and return a requests.Session on success, else None"""
-    global session, _last_login_attempt
+def login_session() -> Optional[requests.Session]:
+    """Create and return an authenticated session (or None)."""
+    global session, _last_login
     now = time.time()
-    if now - _last_login_attempt < LOGIN_MIN_INTERVAL:
-        return None
-    _last_login_attempt = now
+    if now - _last_login < LOGIN_MIN_INTERVAL:
+        logger.debug("Login throttled.")
+        return session
+    _last_login = now
 
     if not USERNAME or not PASSWORD:
-        logger.error("USERNAME/PASSWORD not set - cannot login.")
+        logger.error("USERNAME or PASSWORD not set.")
         return None
 
     s = requests.Session()
     s.headers.update({"User-Agent": USER_AGENT, "Referer": SITE_BASE})
+
     try:
         r = s.get(LOGIN_URL, timeout=REQUEST_TIMEOUT)
     except Exception as e:
-        logger.warning("GET login page failed: %s", e)
+        logger.warning("GET login failed: %s", e)
         return None
 
-    if r.status_code >= 400:
-        # try root
-        try:
-            r = s.get(SITE_BASE, timeout=REQUEST_TIMEOUT)
-        except Exception as e:
-            logger.warning("GET site root failed: %s", e)
-            return None
+    page_text = r.text or ""
+    # compute captcha
+    answer = compute_math_from_text(page_text)
+    if answer is None:
+        nums = DIGITS.findall(page_text)
+        if len(nums) >= 2:
+            try:
+                answer = str(int(nums[0]) + int(nums[1]))
+            except Exception:
+                answer = None
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    login_form = None
-    # find a form containing a password input
-    for f in soup.find_all("form"):
-        if f.find("input", {"type": "password"}):
-            login_form = f
-            break
-    if not login_form:
-        login_form = soup.find("form")
-
-    if not login_form:
-        logger.warning("No login form found on page.")
+    if answer is None:
+        logger.warning("Could not find/solve math captcha on login page. Snippet: %s", (page_text[:200].replace("\n"," ")))
         return None
 
-    username_field, password_field, captcha_field, token_field, token_value, action = discover_form_fields(login_form)
-    post_url = urljoin(r.url, action) if action else r.url
+    payload = {
+        "username": USERNAME,
+        "password": PASSWORD,
+        "capt": answer
+    }
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": LOGIN_URL,
+        "Origin": SITE_BASE,
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
 
-    payload = {}
-    if username_field:
-        payload[username_field] = USERNAME
-    else:
-        payload['username'] = USERNAME
-        payload['email'] = USERNAME
-    if password_field:
-        payload[password_field] = PASSWORD
-    else:
-        payload['password'] = PASSWORD
-
-    if token_field:
-        if token_value:
-            payload[token_field] = token_value
-        else:
-            # try meta tag
-            meta = soup.find("meta", {"name": "csrf-token"})
-            if meta and meta.get("content"):
-                payload[token_field] = meta.get("content")
-
-    # if captcha field present, try to compute answer from surrounding text
-    if captcha_field:
-        # find label or text content near captcha input
-        captcha_input = login_form.find("input", {"name": captcha_field})
-        captcha_text = ""
-        if captcha_input:
-            # check label with for attr
-            if captcha_input.has_attr("id"):
-                label = login_form.find("label", {"for": captcha_input.get("id")})
-                if label:
-                    captcha_text = label.get_text(separator=" ", strip=True)
-            if not captcha_text:
-                # look at previous texts in form
-                prev = captcha_input.find_previous(string=True)
-                if prev:
-                    captcha_text = prev.strip()
-        if not captcha_text:
-            captcha_text = login_form.get_text(separator=" ", strip=True)
-        answer = compute_simple_math_answer(captcha_text)
-        if answer is not None:
-            payload[captcha_field] = answer
-            logger.info("Solved captcha: '%s' -> %s", captcha_text, answer)
-        else:
-            logger.warning("Could not solve captcha automatically (text=%r).", captcha_text)
-
-    headers = {"User-Agent": USER_AGENT, "Referer": r.url}
     try:
-        post_res = s.post(post_url, data=payload, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        post = s.post(SIGNIN_URL, data=payload, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=True)
     except Exception as e:
         logger.warning("Login POST failed: %s", e)
         return None
 
-    body_low = (post_res.text or "").lower()
-    if "logout" in body_low or "dashboard" in body_low or ("/login" not in str(post_res.url)):
-        logger.info("Login appears successful (post -> %s)", post_res.url)
+    lower = (post.text or "").lower()
+    # heuristics for success
+    if "logout" in lower or ("/login" not in post.url.lower() and post.status_code in (200, 302, 303)):
         session = s
+        logger.info("Login appears successful.")
         return session
-
-    # try fetching dashboard to confirm
+    # verify by fetching dashboard
     try:
         chk = s.get(DASH_URL, timeout=REQUEST_TIMEOUT)
-        if chk.status_code < 400 and ("sms" in (chk.text or "").lower() or "received" in (chk.text or "").lower()):
-            logger.info("Login confirmed via dashboard fetch.")
+        chk_text = (chk.text or "").lower()
+        if chk.status_code < 400 and ("sms" in chk_text or "dashboard" in chk_text or "received" in chk_text):
             session = s
+            logger.info("Login confirmed via dashboard.")
             return session
     except Exception:
         pass
 
-    logger.warning("Login did not clearly succeed (status %s, url %s).", post_res.status_code, post_res.url)
+    logger.warning("Login not confirmed. Snippet: %s", ((post.text or "")[:300].replace("\n"," ")))
     return None
 
-def ensure_session():
-    """Ensure session is valid; attempt login if not."""
+def ensure_session() -> Optional[requests.Session]:
+    """Return a usable session (login if needed)."""
     global session
     if session is None:
-        session = create_logged_session()
+        session = login_session()
     else:
+        # probe data API quickly to ensure not redirected
         try:
-            r = session.get(DASH_URL, timeout=REQUEST_TIMEOUT)
+            r = session.get(DATA_API_URL, params={"_": int(time.time()*1000)}, timeout=REQUEST_TIMEOUT)
             body = (r.text or "").lower()
-            if r.status_code >= 400 or ("login" in body and "password" in body):
-                logger.info("Session expired or redirected to login; recreating session.")
-                session = create_logged_session()
+            if r.status_code >= 400 or ("username" in body and "password" in body) or ("what is" in body and "?" in body):
+                logger.info("Session invalid according to probe; re-login.")
+                try:
+                    session.close()
+                except Exception:
+                    pass
+                session = login_session()
         except Exception:
-            logger.info("Session probe failed; will recreate.")
-            session = create_logged_session()
+            logger.info("Session probe failed; re-login.")
+            try:
+                session.close()
+            except Exception:
+                pass
+            session = login_session()
     return session
 
-def clear_session():
-    global session
-    try:
-        if session:
-            session.close()
-    except Exception:
-        pass
-    session = None
-
-# ---------------- JSON API fetching & parsing ----------------
-def call_data_api():
-    """
-    Call DATA_API_URL with parameters for last day (or current date) to fetch aaData JSON.
-    Returns parsed JSON object or None.
-    """
-    # prepare params similar to what browser sends - keep display length reasonable
-    today = datetime.utcnow()
-    fdate2 = today.strftime("%Y-%m-%d %H:%M:%S")
-    fdate1 = (today - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
-    # Base params minimal to get aaData, many can be left as default/empty
+# ---------------- data fetch & parse ----------------
+def fetch_json_rows() -> Optional[list]:
+    """Return aaData list or None."""
+    # params: last 24 hours by default
+    now = datetime.utcnow()
+    fdate2 = now.strftime("%Y-%m-%d %H:%M:%S")
+    fdate1 = (now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
     params = {
         "fdate1": fdate1,
         "fdate2": fdate2,
@@ -385,230 +262,190 @@ def call_data_api():
         "fg": "0",
         "sEcho": "1",
         "iColumns": "9",
-        "sColumns": ",,,,,,, ,",
         "iDisplayStart": "0",
-        "iDisplayLength": "100",  # fetch up to 100 rows
+        "iDisplayLength": "100",
         "_": str(int(time.time() * 1000))
     }
-    # Join as query string
-    query = DATA_API_URL + "?" + urlencode(params)
-    s = ensure_session()
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "X-Requested-With": "XMLHttpRequest",
         "Referer": DASH_URL
     }
-    # prefer session (authenticated) but allow fallback to plain GET
-    if s:
+
+    s = ensure_session()
+    tried = False
+    for attempt in range(2):
         try:
-            r = s.get(query, headers=headers, timeout=REQUEST_TIMEOUT)
-            if r.status_code == 200:
-                text = r.text
-                # The server sometimes returns text/html but body is JSON
-                try:
-                    return json.loads(text)
-                except Exception:
-                    # strip any leading/trailing junk then parse
-                    start = text.find("{")
-                    end = text.rfind("}") + 1
-                    if start != -1 and end != -1:
-                        try:
-                            return json.loads(text[start:end])
-                        except Exception:
-                            logger.exception("JSON parse failed after trimming")
-                            return None
+            if s:
+                r = s.get(DATA_API_URL, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
             else:
-                logger.warning("Data API returned status %s", r.status_code)
+                r = requests.get(DATA_API_URL, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
         except Exception as e:
-            logger.warning("Data API request via session failed: %s", e)
-            clear_session()
-            # fallback below to unauthenticated
-    try:
-        r = requests.get(query, headers=headers, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
+            logger.warning("Data API request attempt %d failed: %s", attempt+1, e)
+            if s and not tried:
+                tried = True
+                s = login_session()
+                continue
+            return None
+
+        body = r.text or ""
+        lower = body.lower()
+        # detect HTML login page
+        if ("username" in lower and "password" in lower) or ("what is" in lower and "?" in lower) or ("<html" in lower and "login" in lower):
+            snippet = (body[:300].replace("\n"," ") if body else "")
+            logger.info("Data API returned login/html page snippet: %s", snippet)
+            if not tried:
+                tried = True
+                s = login_session()
+                continue
+            return None
+
         try:
-            return r.json()
+            data = r.json()
+            aa = data.get("aaData", [])
+            return aa
         except Exception:
-            text = r.text
-            start = text.find("{")
-            end = text.rfind("}") + 1
+            # fallback: try to extract braces region
+            start = body.find("{"); end = body.rfind("}") + 1
             if start != -1 and end != -1:
                 try:
-                    return json.loads(text[start:end])
+                    data = json.loads(body[start:end])
+                    return data.get("aaData", [])
                 except Exception:
-                    logger.exception("Fallback JSON parse failed")
+                    logger.exception("JSON parse failed after trim")
                     return None
-    except Exception as e:
-        logger.warning("Data API unauthenticated GET failed: %s", e)
-        return None
+            logger.warning("Data API returned non-JSON response.")
+            return None
+    return None
 
-def parse_api_row(row):
-    """
-    Given a single row entry (list), map indices to fields and return dict:
-    {id, time, number, message, service, code, country}
-    Expected structure (based on sample): 
-      [0]=time, [1]=operator, [2]=number, [3]=maybe cli/service, [4]=client, [5]=message, ...
-    """
+def parse_row_to_entry(row: list) -> Optional[dict]:
+    """Map row -> dict with id, time, number, service, message, code, country."""
     try:
-        time_str = row[0] if len(row) > 0 else ""
+        ts = row[0] if len(row) > 0 else ""
+        operator = row[1] if len(row) > 1 else ""
         number = str(row[2]) if len(row) > 2 else ""
-        raw_service_field = str(row[3]) if len(row) > 3 else ""
-        client = str(row[4]) if len(row) > 4 else ""
-        message = str(row[5]) if len(row) > 5 else ""
+        service_field = row[3] if len(row) > 3 else ""
+        client = row[4] if len(row) > 4 else ""
+        message = row[5] if len(row) > 5 else ""
     except Exception:
         return None
 
-    # Normalize number: remove spaces
     number = number.strip()
-    # Extract OTP: prefer hyphenated group (e.g., 934-045) then plain numeric
-    code = None
-    m = OTP_RE_HYPHEN.search(message)
+    # otp extraction
+    m = OTP_HYPH.search(message)
     if m:
         code = m.group(1)
-        # also remove hyphen for login link if needed
         code_plain = code.replace("-", "")
     else:
-        m2 = OTP_RE_PLAIN.search(message)
-        if m2:
-            code = m2.group(1)
-            code_plain = code
-    if not code:
-        code = "N/A"
-        code_plain = "N/A"
+        m2 = OTP_PLAIN.search(message)
+        code = m2.group(1) if m2 else "N/A"
+        code_plain = code
 
-    # Service detection: check raw_service_field then message text
-    service_guess = "Unknown"
-    if raw_service_field and raw_service_field.strip().lower() not in ("", "whatsapp", "sms", "whatsapp"):
-        # sometimes 3rd or 4th column indicates "Whatsapp" or "Whatsapp" appears in sample as "Whatsapp"
-        service_guess = raw_service_field.strip()
-    else:
-        service_guess = detect_service_from_text(message)
+    # service detection preference: service_field if meaningful else message
+    service_guess = str(service_field).strip() if service_field and str(service_field).strip() not in ("", "0", "-") else detect_service(message)
 
-    country = get_country_from_number(number)
-
-    uid_source = f"{number}|{message}|{time_str}"
-    uid = sha1(uid_source.encode("utf-8")).hexdigest()
+    country = get_country(number)
+    uid_src = f"{number}|{message}|{ts}"
+    uid = sha1(uid_src.encode("utf-8")).hexdigest()
 
     return {
         "id": uid,
-        "time": time_str,
+        "time": ts,
+        "operator": operator,
         "number": number,
-        "raw_service_field": raw_service_field,
+        "service": service_guess,
         "client": client,
         "message": message,
-        "service": service_guess,
         "code": code,
         "code_plain": code_plain,
         "country": country
     }
 
-# ---------------- message formatting & sending ----------------
-def format_for_telegram(entry):
-    number = entry.get("number") or "N/A"
-    code = entry.get("code") or "N/A"
-    code_plain = entry.get("code_plain", code)
-    text = entry.get("message", "")
-    time_str = entry.get("time") or datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    service_name = entry.get("service") or "Unknown"
-    service_emoji = SERVICE_EMOJIS.get(service_name, SERVICE_EMOJIS.get("Unknown"))
-    country = entry.get("country") or "Unknown"
+# ---------------- format & send ----------------
+def format_message(entry: dict) -> str:
+    number = entry.get("number", "N/A")
+    code = entry.get("code", "N/A")
+    service = entry.get("service", "Unknown")
+    country = entry.get("country", "Unknown")
+    ts = entry.get("time", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+    msg = entry.get("message", "")
     tail = random_tail(10)
 
-    login_link_section = ""
-    # include t.me/login link if Telegram service or message mentions telegram
-    if (("telegram" in (service_name or "").lower()) or ("telegram" in (text or "").lower())) and code_plain not in (None, "N/A"):
-        login_link_section = f"\nYou can also tap on this link to log in:\nhttps://t.me/login/{code_plain}\n"
+    login_link = ""
+    if ("telegram" in service.lower() or "telegram" in (msg or "").lower()) and entry.get("code_plain") not in (None, "N/A"):
+        login_link = f"\nYou can also tap on this link to log in:\nhttps://t.me/login/{entry.get('code_plain')}\n"
 
-    # Build message — send as plain text (no Markdown) to avoid escaping issues
-    msg = (
+    text = (
         "˹𝐕𝐢𝐛𝐞ꭙ 𝐅ʟ𝐨𝐰™ ˼:\n"
         "🔔 You have successfully received OTP\n\n"
         f"📞 Number: {number}\n"
         f"🔑 Code: {code}\n"
-        f"🏆 Service: {service_emoji} {service_name}\n"
+        f"🏆 Service: {service}\n"
         f"🌎 Country: {country}\n"
-        f"⏳ Time: {time_str}\n\n"
+        f"⏳ Time: {ts}\n\n"
         "💬 Message:\n"
-        f"{text}\n"
-        f"{login_link_section}\n"
+        f"{msg}\n"
+        f"{login_link}"
         f"{tail}"
     )
-    return msg
+    return text
 
-def send_to_telegram(chat_id, text):
-    payload = {"chat_id": chat_id, "text": text}
-    try:
-        r = requests.post(TELEGRAM_API_SEND, data=payload, timeout=REQUEST_TIMEOUT)
-        if r.status_code != 200:
-            logger.warning("Telegram send failed %s -> %s", r.status_code, r.text[:200])
-    except Exception as e:
-        logger.exception("Failed to send telegram message: %s", e)
-
-# ---------------- main poll & forward logic ----------------
-def poll_and_forward_once():
-    global seen
-    data = call_data_api()
-    if not data:
-        logger.debug("No data returned from API.")
-        return
-    aa = data.get("aaData") if isinstance(data, dict) else None
-    if not aa:
-        logger.debug("aaData not found or empty.")
-        return
-    new_count = 0
-    # aaData is list of rows (each row is a list)
-    for row in aa:
+def send_telegram_to_all(text: str):
+    for cid in CHAT_IDS_LIST:
         try:
-            parsed = parse_api_row(row)
-            if not parsed:
-                continue
-            uid = parsed.get("id")
-            if not uid or uid in seen:
-                continue
-            # Add to seen early to avoid duplicates during processing crash
-            seen.add(uid)
-            msg_text = format_for_telegram(parsed)
-            for cid in CHAT_IDS_LIST:
-                send_to_telegram(cid, msg_text)
-                time.sleep(0.15)
-            new_count += 1
-            # small delay between rows to reduce burst
-            time.sleep(0.2)
-        except Exception:
-            logger.exception("Error processing row")
-    if new_count:
-        logger.info("Sent %d new messages.", new_count)
-        # persist seen
+            resp = requests.post(TELEGRAM_API_SEND, data={"chat_id": cid, "text": text}, timeout=10)
+            if resp.status_code != 200:
+                logger.warning("Telegram send failed for %s: %s %s", cid, resp.status_code, resp.text[:200])
+        except Exception as e:
+            logger.exception("Error sending to Telegram for %s: %s", cid, e)
+
+# ---------------- main loop ----------------
+def poll_cycle():
+    aa = fetch_json_rows()
+    if not aa:
+        logger.debug("No rows returned this cycle.")
+        return
+    # aa is list of rows; they are usually sorted newest-first
+    # process oldest-first for meaningful order
+    for row in reversed(aa):
+        entry = parse_row_to_entry(row)
+        if not entry:
+            continue
+        uid = entry.get("id")
+        if not uid or uid in seen:
+            continue
+        seen.add(uid)
+        text = format_message(entry)
+        logger.info("Forwarding OTP id=%s number=%s code=%s", uid[:8], entry.get("number"), entry.get("code"))
+        send_telegram_to_all(text)
+        time.sleep(0.15)
+    if aa:
         save_seen(seen)
 
-def main_loop():
-    logger.info("Starting OTP forwarder (JSON API) with login support.")
-    logger.info("Login URL: %s", LOGIN_URL)
-    logger.info("Data API URL: %s", DATA_API_URL)
-    logger.info("Polling every %s seconds", POLL_INTERVAL)
+def main():
+    logger.info("Starting OTP forwarder (complete).")
+    # validations
+    if not BOT_TOKEN or not CHAT_IDS_LIST:
+        logger.error("BOT_TOKEN and CHAT_IDS env vars required. Exiting.")
+        raise SystemExit(1)
+    if not USERNAME or not PASSWORD:
+        logger.error("USERNAME and PASSWORD env vars required for login. Exiting.")
+        raise SystemExit(1)
 
-    # initial ensure session
+    # initial login
     ensure_session()
 
     try:
         while True:
             try:
-                poll_and_forward_once()
+                poll_cycle()
             except Exception:
-                logger.exception("Unhandled exception in poll cycle")
+                logger.exception("Unhandled exception in poll cycle.")
             time.sleep(POLL_INTERVAL)
     except KeyboardInterrupt:
-        logger.info("Interrupted by user. Saving state and exiting.")
+        logger.info("Interrupted by user; saving state.")
         save_seen(seen)
 
 if __name__ == "__main__":
-    # validation
-    if not BOT_TOKEN or not CHAT_IDS_LIST:
-        logger.error("BOT_TOKEN and CHAT_IDS environment variables are required. Exiting.")
-        raise SystemExit(1)
-    if not USERNAME or not PASSWORD:
-        logger.error("USERNAME and PASSWORD environment variables are required for login. Exiting.")
-        raise SystemExit(1)
-
-    main_loop()
+    main()
