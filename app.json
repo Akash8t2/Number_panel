@@ -1,81 +1,56 @@
 {
-  "name": "otp-forwarder-bot",
-  "description": "Forward OTPs from IMS SMS Dashboard (45.82.67.20) to Telegram chats. Logs in, solves simple math captcha, polls JSON API and forwards OTPs.",
-  "repository": "",
-  "stack": "heroku-24",
-  "buildpacks": [
-    {
-      "url": "heroku/python"
-    }
-  ],
+  "name": "ims-otp-forwarder",
+  "description": "Termux/Heroku-ready IMS OTP forwarder (Telegram bot + dedupe + live polling).",
+  "repository": "https://github.com/Akash8t2/ims",
+  "keywords": ["python", "otp", "telegram", "heroku", "forwarder"],
+  "stack": "heroku-22",
   "env": {
     "BOT_TOKEN": {
-      "description": "Telegram Bot Token (from @BotFather). Example: 123456:ABCdef...",
-      "required": true
+      "description": "Telegram bot token from BotFather",
+      "value": ""
     },
     "CHAT_IDS": {
-      "description": "Comma-separated Telegram chat IDs (groups or users). Example: -100123...,987654321",
-      "required": true
+      "description": "Comma-separated chat IDs where OTPs should be forwarded",
+      "value": "-1003072064847"
+    },
+    "ADMIN_CHAT_IDS": {
+      "description": "Optional admin chat IDs (comma separated)",
+      "value": ""
     },
     "USERNAME": {
-      "description": "Website login username for http://45.82.67.20",
-      "required": true
+      "description": "IMS panel username",
+      "value": ""
     },
     "PASSWORD": {
-      "description": "Website login password",
-      "required": true
+      "description": "IMS panel password",
+      "value": ""
     },
     "SITE_BASE": {
-      "description": "Base URL of the SMS dashboard site",
+      "description": "Base URL of the IMS site (default http://45.82.67.20)",
       "value": "http://45.82.67.20"
     },
-    "LOGIN_PATH": {
-      "description": "Path to login page (relative to SITE_BASE)",
-      "value": "/ints/login"
-    },
-    "SIGNIN_PATH": {
-      "description": "Path to signin POST (relative to SITE_BASE)",
-      "value": "/ints/signin"
-    },
-    "DASH_PATH": {
-      "description": "Dashboard path used as referer",
-      "value": "/ints/agent/SMSDashboard"
-    },
-    "DATA_API_PATH": {
-      "description": "JSON data endpoint path",
-      "value": "/ints/agent/res/data_smscdr.php"
+    "COOKIES": {
+      "description": "Optional injected cookies, e.g. PHPSESSID=xxxx",
+      "value": ""
     },
     "POLL_INTERVAL": {
-      "description": "Seconds between polls of the JSON API",
-      "value": "6"
+      "description": "Polling interval in seconds (default 1)",
+      "value": "1"
     },
-    "STATE_FILE": {
-      "description": "Filename for persisting processed IDs in the dyno filesystem",
-      "value": "processed_sms_ids.json"
-    },
-    "REQUEST_TIMEOUT": {
-      "description": "Seconds for HTTP request timeouts",
-      "value": "15"
-    },
-    "USER_AGENT": {
-      "description": "User-Agent header used for requests",
-      "value": "Mozilla/5.0 (X11; Linux x86_64)"
-    },
-    "SESSION_VALIDATE_INTERVAL": {
-      "description": "Seconds between session validation probes (reduce repeated logins)",
-      "value": "60"
-    },
-    "LOGIN_MIN_INTERVAL": {
-      "description": "Minimum seconds between login attempts (backoff)",
-      "value": "5"
+    "FORWARD_IF_NO_CODE": {
+      "description": "Forward SMS even if no OTP code found (true/false)",
+      "value": "true"
     }
   },
   "formation": {
     "worker": {
-      "quantity": 1
+      "quantity": 1,
+      "size": "free"
     }
   },
-  "scripts": {
-    "postdeploy": "echo 'Deployed OTP Forwarder. Set BOT_TOKEN, CHAT_IDS, USERNAME and PASSWORD as config vars.'"
-  }
+  "buildpacks": [
+    {
+      "url": "heroku/python"
+    }
+  ]
 }
