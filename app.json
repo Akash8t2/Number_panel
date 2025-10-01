@@ -1,51 +1,78 @@
 {
   "name": "ims-otp-forwarder",
-  "description": "Termux/Heroku-ready IMS OTP forwarder (Telegram bot + dedupe + live polling).",
-  "repository": "https://github.com/Akash8t2/ims",
-  "keywords": ["python", "otp", "telegram", "heroku", "forwarder"],
+  "description": "IMS SMS OTP forwarder — Telegram bot, MongoDB storage, live polling, dedupe. Heroku-ready.",
+  "repository": "https://github.com/yourusername/ims-otp-forwarder",
+  "logo": "https://raw.githubusercontent.com/heroku/node-js-sample/master/public/node.svg",
+  "keywords": ["python", "otp", "telegram", "mongodb", "heroku"],
   "stack": "heroku-22",
   "env": {
     "BOT_TOKEN": {
-      "description": "Telegram bot token from BotFather",
+      "description": "Telegram bot token from BotFather (required)",
+      "required": true,
       "value": ""
     },
     "CHAT_IDS": {
-      "description": "Comma-separated chat IDs where OTPs should be forwarded",
+      "description": "Comma-separated Telegram chat IDs to forward OTPs to (required)",
+      "required": true,
       "value": "-1003072064847"
     },
-    "ADMIN_CHAT_IDS": {
-      "description": "Optional admin chat IDs (comma separated)",
-      "value": ""
-    },
     "USERNAME": {
-      "description": "IMS panel username",
+      "description": "IMS panel username (used for automated login if COOKIES not provided)",
       "value": ""
     },
     "PASSWORD": {
-      "description": "IMS panel password",
+      "description": "IMS panel password (used for automated login if COOKIES not provided)",
+      "value": ""
+    },
+    "COOKIES": {
+      "description": "Optional cookie string to inject (format: \"k=v; k2=v2\"). If provided, script will try these first.",
       "value": ""
     },
     "SITE_BASE": {
-      "description": "Base URL of the IMS site (default http://45.82.67.20)",
+      "description": "Base URL of the IMS site",
       "value": "http://45.82.67.20"
     },
-    "COOKIES": {
-      "description": "Optional injected cookies, e.g. PHPSESSID=xxxx",
-      "value": ""
-    },
     "POLL_INTERVAL": {
-      "description": "Polling interval in seconds (default 1)",
-      "value": "1"
+      "description": "Polling interval in seconds for live fetch (float). Increase to reduce Telegram rate-limit risk.",
+      "value": "1.5"
+    },
+    "STATE_FILE": {
+      "description": "Local filename used for short-term seen-state (dyno ephemeral). MongoDB is authoritative for dedupe.",
+      "value": "processed_sms_ids.json"
+    },
+    "REQUEST_TIMEOUT": {
+      "description": "HTTP request timeout (seconds)",
+      "value": "15"
+    },
+    "USER_AGENT": {
+      "description": "User-Agent string used for requests",
+      "value": "Mozilla/5.0 (X11; Linux x86_64)"
+    },
+    "MONGO_URI": {
+      "description": "MongoDB connection string (set to your Atlas URI). WARNING: don't commit this publicly if sensitive.",
+      "value": "mongodb+srv://BrandedSupportGroup:BRANDED_WORLD@cluster0.v4odcq9.mongodb.net/?retryWrites=true&w=majority"
+    },
+    "MONGO_DB": {
+      "description": "Mongo database name",
+      "value": "otp_forwarder"
+    },
+    "MONGO_COLL": {
+      "description": "Mongo collection name",
+      "value": "otps"
     },
     "FORWARD_IF_NO_CODE": {
-      "description": "Forward SMS even if no OTP code found (true/false)",
-      "value": "true"
+      "description": "If 'true' will forward messages even when no OTP code detected. Recommended: false",
+      "value": "false"
+    },
+    "MAX_RELOGIN_RETRIES": {
+      "description": "How many consecutive relogin failures before exponential backoff kicks in",
+      "value": "6"
     }
   },
   "formation": {
     "worker": {
       "quantity": 1,
-      "size": "Basic"
+      "size": "standard-1x"
     }
   },
   "buildpacks": [
