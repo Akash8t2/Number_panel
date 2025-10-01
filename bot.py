@@ -386,8 +386,6 @@ def format_message(entry: dict) -> str:
         f"⏳ Time: {ts}\n\n"
         "💬 Message:\n"
         f"{msg}\n"
-        f"{login_link}"
-        f"{tail}"
     )
     return text
 
