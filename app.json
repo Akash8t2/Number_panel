@@ -1,83 +1,58 @@
 {
-  "name": "ims-otp-forwarder",
-  "description": "IMS SMS OTP forwarder — Telegram bot, MongoDB storage, live polling, dedupe. Heroku-ready.",
-  "repository": "https://github.com/yourusername/ims-otp-forwarder",
-  "logo": "https://raw.githubusercontent.com/heroku/node-js-sample/master/public/node.svg",
-  "keywords": ["python", "otp", "telegram", "mongodb", "heroku"],
-  "stack": "heroku-22",
+  "name": "OTP Forwarder with MongoDB (No Duplicates)",
+  "description": "Auto-forward OTP messages from IMS site to Telegram with MongoDB deduplication and restart-safe cache.",
+  "repository": "https://github.com/your-repo-name/otp-forwarder",
+  "logo": "https://i.ibb.co/6XvnYtM/otpbot.png",
+  "keywords": ["telegram", "otp", "heroku", "bot", "mongo"],
   "env": {
     "BOT_TOKEN": {
-      "description": "Telegram bot token from BotFather (required)",
-      "required": true,
-      "value": ""
+      "description": "Your Telegram Bot Token from @BotFather",
+      "required": true
     },
     "CHAT_IDS": {
-      "description": "Comma-separated Telegram chat IDs to forward OTPs to (required)",
-      "required": true,
-      "value": "-1003072064847"
+      "description": "Comma-separated list of chat/group IDs where OTPs should be sent (e.g. -1001234567890,123456789)",
+      "required": true
     },
     "USERNAME": {
-      "description": "IMS panel username (used for automated login if COOKIES not provided)",
-      "value": ""
+      "description": "IMS panel login username",
+      "required": true
     },
     "PASSWORD": {
-      "description": "IMS panel password (used for automated login if COOKIES not provided)",
-      "value": ""
-    },
-    "COOKIES": {
-      "description": "Optional cookie string to inject (format: \"k=v; k2=v2\"). If provided, script will try these first.",
-      "value": ""
+      "description": "IMS panel login password",
+      "required": true
     },
     "SITE_BASE": {
-      "description": "Base URL of the IMS site",
+      "description": "Base site URL (default: http://45.82.67.20)",
+      "required": false,
       "value": "http://45.82.67.20"
     },
-    "POLL_INTERVAL": {
-      "description": "Polling interval in seconds for live fetch (float). Increase to reduce Telegram rate-limit risk.",
-      "value": "1.5"
+    "MONGO_URI": {
+      "description": "MongoDB connection URI (optional, for deduplication persistence)",
+      "required": false
     },
-    "STATE_FILE": {
-      "description": "Local filename used for short-term seen-state (dyno ephemeral). MongoDB is authoritative for dedupe.",
-      "value": "processed_sms_ids.json"
+    "POLL_INTERVAL": {
+      "description": "Polling interval in seconds (default: 2)",
+      "required": false,
+      "value": "2"
     },
     "REQUEST_TIMEOUT": {
-      "description": "HTTP request timeout (seconds)",
+      "description": "Request timeout in seconds (default: 15)",
+      "required": false,
       "value": "15"
-    },
-    "USER_AGENT": {
-      "description": "User-Agent string used for requests",
-      "value": "Mozilla/5.0 (X11; Linux x86_64)"
-    },
-    "MONGO_URI": {
-      "description": "MongoDB connection string (set to your Atlas URI). WARNING: don't commit this publicly if sensitive.",
-      "value": "mongodb+srv://BrandedSupportGroup:BRANDED_WORLD@cluster0.v4odcq9.mongodb.net/?retryWrites=true&w=majority"
-    },
-    "MONGO_DB": {
-      "description": "Mongo database name",
-      "value": "otp_forwarder"
-    },
-    "MONGO_COLL": {
-      "description": "Mongo collection name",
-      "value": "otps"
-    },
-    "FORWARD_IF_NO_CODE": {
-      "description": "If 'true' will forward messages even when no OTP code detected. Recommended: false",
-      "value": "false"
-    },
-    "MAX_RELOGIN_RETRIES": {
-      "description": "How many consecutive relogin failures before exponential backoff kicks in",
-      "value": "6"
     }
   },
   "formation": {
     "worker": {
       "quantity": 1,
-      "size": "standard-1x"
+      "size": "Basic"
     }
   },
   "buildpacks": [
     {
       "url": "heroku/python"
     }
-  ]
+  ],
+  "scripts": {
+    "postdeploy": "echo '✅ Deployment complete. Your OTP Forwarder bot is now running.'"
+  }
 }
