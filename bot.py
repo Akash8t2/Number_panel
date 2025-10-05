@@ -2,13 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 IMS SMS OTP Forwarder Bot
----------------------------------
-Features:
- - Logs in to https://imssms.org/login using USERNAME/PASSWORD
- - Fetches new SMS data from /client/res/data_smscdr.php
- - Forwards unique messages to Telegram group
- - Optional MongoDB deduplication
- - Heroku-ready (single worker)
+- Supports https://imssms.org/login
+- Fetches SMS JSON safely
+- Forwards to Telegram
+- Optional MongoDB dedupe
+- Heroku-ready
 """
 
 import os
@@ -34,15 +32,14 @@ MONGO_URI = os.getenv("MONGO_URI", "")
 USE_MONGO = bool(MONGO_URI)
 
 # === LOGGING ===
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
 # === SESSION ===
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "Mozilla/5.0 (HerokuBot/1.0)"
+    "User-Agent": "Mozilla/5.0 (HerokuBot/1.0)",
+    "X-Requested-With": "XMLHttpRequest",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
 })
 
 # === MONGO INIT ===
@@ -78,12 +75,14 @@ def ims_login():
             "password": PASSWORD
         }, allow_redirects=True)
         logging.info(f"✅ Login attempted (status {resp.status_code})")
+        # Debug: print cookies
+        logging.info(f"Cookies: {session.cookies.get_dict()}")
         return resp.status_code == 200
     except Exception as e:
         logging.error(f"Login error: {e}")
         return False
 
-# === FETCH DATA ===
+# === FETCH SMS ===
 def fetch_sms():
     try:
         now = datetime.utcnow()
@@ -91,11 +90,14 @@ def fetch_sms():
         end = now.strftime("%Y-%m-%d 23:59:59")
         url = f"{BASE_URL}{DATA_API}?fdate1={start}&fdate2={end}&sEcho=1&iDisplayLength=50"
         resp = session.get(url)
+        logging.info(f"Fetch status: {resp.status_code}")
+        logging.info(f"Fetch content (truncated): {resp.text[:200]}")
         if resp.status_code != 200:
-            logging.warning(f"Fetch fail {resp.status_code}")
             return []
-        data = resp.json().get("aaData", [])
-        return data
+        # Only parse JSON if it starts with {
+        if resp.text.strip().startswith("{"):
+            return resp.json().get("aaData", [])
+        return []
     except Exception as e:
         logging.error(f"Fetch error: {e}")
         return []
@@ -110,7 +112,10 @@ def already_sent(msg_id):
 
 def mark_sent(msg_id):
     if USE_MONGO:
-        sms_col.insert_one({"_id": msg_id})
+        try:
+            sms_col.insert_one({"_id": msg_id})
+        except:
+            pass
     else:
         seen.add(msg_id)
 
@@ -125,14 +130,18 @@ def main():
     while True:
         try:
             for sms in fetch_sms():
-                # Format: [ID, Sender, Receiver, Text, Date, Status, etc.]
                 text = sms[3] if len(sms) > 3 else ""
                 sender = sms[1] if len(sms) > 1 else ""
-                date = sms[4] if len(sms) > 4 else ""
+                date = sms[0] if len(sms) > 0 else ""
                 msg_id = sha1(f"{sender}{text}{date}".encode()).hexdigest()
 
                 if not already_sent(msg_id):
-                    formatted = f"📩 *New SMS*\nFrom: `{sender}`\nText: `{text}`\nDate: {date}"
+                    formatted = (
+                        f"📩 *New SMS*\n"
+                        f"From: `{sender}`\n"
+                        f"Text: `{text}`\n"
+                        f"Date: {date}"
+                    )
                     send_telegram(formatted)
                     mark_sent(msg_id)
             time.sleep(20)
