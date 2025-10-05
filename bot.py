@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IMS SMS Forwarder - DEBUG VERSION
-Enhanced logging to diagnose authentication issues
+IMS SMS Forwarder - WORKING VERSION
+Based on successful API call parameters
 """
 
 import os
@@ -18,7 +18,7 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
-# --- config via env ---
+# --- config ---
 BASE_URL = os.getenv("BASE_URL", "https://imssms.org").rstrip("/")
 LOGIN_PATH = os.getenv("LOGIN_PATH", "/login")
 DATA_API_PATH = os.getenv("IMSSMS_DATA_API_PATH", "/client/res/data_smscdr.php")
@@ -35,33 +35,22 @@ IMS_PASSWORD = os.getenv("IMS_PASSWORD") or os.getenv("IMS_PASS")
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "15"))
 STATE_FILE = os.getenv("STATE_FILE", "seen_imssms.json")
 
-# --- enhanced logging ---
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
-)
-log = logging.getLogger("imssms-debug")
+# --- logging ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+log = logging.getLogger("imssms-working")
 
-# --- session with better headers ---
+# --- session ---
 session = requests.Session()
 session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
-    "DNT": "1",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "same-origin",
 })
 
 # regex
 OTP_RE = re.compile(r"\b\d{3,8}\b")
 MATH_Q_RE = re.compile(r'What is\s*([0-9]+)\s*([+\-xX*\/])\s*([0-9]+)', re.I)
 
-# --- seen local store ---
+# --- seen storage ---
 def load_seen():
     try:
         if os.path.exists(STATE_FILE):
@@ -82,7 +71,21 @@ def save_seen(seen_set):
 
 seen = load_seen()
 
-# --- helper to solve math captcha ---
+# --- Telegram send ---
+def send_telegram(msg: str):
+    if not BOT_TOKEN or not CHAT_IDS:
+        log.warning("Telegram token or chat ids missing; skipping send")
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    for cid in CHAT_IDS:
+        try:
+            resp = requests.post(url, data={"chat_id": cid, "text": msg, "parse_mode": "Markdown"}, timeout=10)
+            if resp.status_code != 200:
+                log.warning("Telegram send failure %s: %s", resp.status_code, resp.text[:200])
+        except Exception as e:
+            log.warning("Telegram send exception: %s", e)
+
+# --- Math solver ---
 def solve_math(text):
     m = MATH_Q_RE.search(text or "")
     if not m:
@@ -98,178 +101,87 @@ def solve_math(text):
         return str(a // b if b != 0 else 0)
     return None
 
-# --- Telegram send ---
-def send_telegram(msg: str):
-    if not BOT_TOKEN or not CHAT_IDS:
-        log.warning("Telegram token or chat ids missing; skipping send")
-        return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    for cid in CHAT_IDS:
-        try:
-            resp = requests.post(url, data={"chat_id": cid, "text": msg, "parse_mode": "Markdown"}, timeout=10)
-            if resp.status_code != 200:
-                log.warning("Telegram send failure %s: %s", resp.status_code, resp.text[:200])
-        except Exception as e:
-            log.warning("Telegram send exception: %s", e)
-
-# --- DEBUG: Save response to file for inspection ---
-def save_debug_html(content, filename):
-    try:
-        with open(f"/tmp/{filename}", "w", encoding="utf-8") as f:
-            f.write(content)
-        log.info("💾 DEBUG: Saved %s", filename)
-    except Exception as e:
-        log.warning("Could not save debug file: %s", e)
-
-# --- Enhanced login with detailed debugging ---
-def ims_login(max_attempts=2):
+# --- Login function ---
+def ims_login(max_attempts=3):
     if not IMS_USERNAME or not IMS_PASSWORD:
         log.error("IMS_USERNAME / IMS_PASSWORD not set")
         return False
 
-    attempt = 0
-    while attempt < max_attempts:
-        attempt += 1
+    for attempt in range(1, max_attempts + 1):
         try:
-            log.info("🔍 GET login page: %s", LOGIN_URL)
-            r = session.get(LOGIN_URL, timeout=20)
+            log.info("GET login page: %s", LOGIN_URL)
+            r = session.get(LOGIN_URL, timeout=15)
             
-            log.info("📄 Login page status: %d", r.status_code)
-            log.info("🍪 Initial cookies: %s", session.cookies.get_dict())
-            
-            # Save login page for inspection
-            save_debug_html(r.text, "login_page.html")
-            
-            if r.status_code == 403:
-                log.error("❌ Login GET 403 Forbidden")
-                log.error("Response headers: %s", dict(r.headers))
-                return False
+            if r.status_code != 200:
+                log.error("Login GET failed: %s", r.status_code)
+                continue
                 
-            r.raise_for_status()
             soup = BeautifulSoup(r.text, "html.parser")
-
-            # Find form and extract all inputs
             form = soup.find("form")
             if not form:
-                log.error("❌ No form found on login page")
-                save_debug_html(r.text, "no_form_page.html")
-                return False
+                log.error("No login form found")
+                continue
 
             action = form.get("action", "")
-            method = form.get("method", "post").lower()
             action_url = urljoin(LOGIN_URL, action)
-            
-            log.info("📝 Form action: %s (method: %s)", action_url, method)
 
             # Extract all form fields
             payload = {}
-            username_field = None
-            password_field = None
-            
             for inp in form.find_all("input"):
                 name = inp.get("name")
                 value = inp.get("value", "")
-                inp_type = (inp.get("type") or "text").lower()
-                
-                if not name:
-                    continue
-                    
-                # Identify username/password fields
-                lname = name.lower()
-                if inp_type == "text" and any(x in lname for x in ["user", "email", "login"]):
-                    username_field = name
-                elif inp_type == "password":
-                    password_field = name
-                
-                # Include hidden fields
-                if inp_type == "hidden":
+                if name:
                     payload[name] = value
-                    log.info("🔍 Hidden field: %s = %s", name, value[:50] + "..." if len(value) > 50 else value)
 
-            # Fallback to common field names
-            if not username_field:
-                username_field = "username"
-            if not password_field:
-                password_field = "password"
-                
-            payload[username_field] = IMS_USERNAME
-            payload[password_field] = IMS_PASSWORD
+            # Set credentials
+            payload["username"] = IMS_USERNAME
+            payload["password"] = IMS_PASSWORD
 
-            log.info("👤 Username field: %s", username_field)
-            log.info("🔒 Password field: %s", password_field)
-
-            # Check for math captcha
+            # Math captcha
             math_answer = solve_math(soup.get_text())
             if math_answer:
-                log.info("🧮 Math captcha detected: answer = %s", math_answer)
-                # Try common captcha field names
-                for field in ["captcha", "answer", "verification", "math"]:
-                    if field not in payload:
-                        payload[field] = math_answer
-                        log.info("📝 Added math answer to field: %s", field)
-                        break
+                payload["captcha"] = math_answer
 
-            log.info("📦 Final payload keys: %s", list(payload.keys()))
-
-            # Prepare POST request
+            # Login headers
             headers = {
                 "Referer": LOGIN_URL,
                 "Origin": BASE_URL,
                 "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "X-Requested-With": "XMLHttpRequest",
             }
 
-            log.info("🚀 POST login to: %s", action_url)
-            if method == "get":
-                post_resp = session.get(action_url, params=payload, headers=headers, allow_redirects=True, timeout=20)
-            else:
-                post_resp = session.post(action_url, data=payload, headers=headers, allow_redirects=True, timeout=20)
-
-            log.info("📨 Login POST status: %d", post_resp.status_code)
-            log.info("🔐 Cookies after login: %s", session.cookies.get_dict())
+            log.info("POST login to: %s", action_url)
+            post = session.post(action_url, data=payload, headers=headers, allow_redirects=True, timeout=20)
             
-            # Save login response for inspection
-            save_debug_html(post_resp.text, "login_response.html")
+            log.info("Login POST status: %s", post.status_code)
+            log.info("Cookies after login: %s", session.cookies.get_dict())
 
-            # Test dashboard access
+            # Verify login by accessing dashboard
             dashboard_url = urljoin(BASE_URL, "/client/SMSDashboard")
-            log.info("🔍 Testing dashboard access: %s", dashboard_url)
-            dash_resp = session.get(dashboard_url, timeout=15)
+            dash = session.get(dashboard_url, timeout=15)
             
-            log.info("📊 Dashboard status: %d", dash_resp.status_code)
-            save_debug_html(dash_resp.text, "dashboard.html")
-
-            # Check for success indicators
-            success_indicators = [
-                "SMSDashboard" in dash_resp.text,
-                "logout" in dash_resp.text.lower(),
-                "dashboard" in dash_resp.text.lower(),
-                session.cookies.get_dict()  # Has cookies
-            ]
-            
-            if any(success_indicators):
+            if dash.status_code == 200 and "SMSDashboard" in dash.text:
                 log.info("✅ Login successful!")
                 return True
             else:
-                log.warning("⚠️ Login may have failed - no clear success indicators")
-                if "login" in dash_resp.text.lower():
-                    log.error("❌ Still seeing login page - credentials may be wrong")
-                
+                log.warning("Dashboard verification failed")
+                continue
+
         except Exception as e:
-            log.exception("💥 Login attempt %d failed: %s", attempt, e)
+            log.exception("Login attempt %d failed: %s", attempt, e)
             time.sleep(5)
             
-    log.error("❌ All login attempts failed")
+    log.error("All login attempts failed")
     return False
 
-# --- Enhanced fetch with detailed debugging ---
+# --- WORKING FETCH - Based on successful API call ---
 def fetch_sms(minutes_back=15):
     try:
         now = datetime.now(timezone.utc)
         f1 = (now - timedelta(minutes=minutes_back)).strftime("%Y-%m-%d %H:%M:%S")
         f2 = now.strftime("%Y-%m-%d %H:%M:%S")
         
+        # EXACT parameters from successful API call
         params = {
             "fdate1": f1,
             "fdate2": f2,
@@ -287,60 +199,96 @@ def fetch_sms(minutes_back=15):
             "sColumns": ",,,,,,",
             "iDisplayStart": "0",
             "iDisplayLength": "25",
+            "mDataProp_0": "0",
+            "sSearch_0": "",
+            "bRegex_0": "false",
+            "bSearchable_0": "true",
+            "bSortable_0": "true",
+            "mDataProp_1": "1",
+            "sSearch_1": "",
+            "bRegex_1": "false",
+            "bSearchable_1": "true",
+            "bSortable_1": "true",
+            "mDataProp_2": "2",
+            "sSearch_2": "",
+            "bRegex_2": "false",
+            "bSearchable_2": "true",
+            "bSortable_2": "true",
+            "mDataProp_3": "3",
+            "sSearch_3": "",
+            "bRegex_3": "false",
+            "bSearchable_3": "true",
+            "bSortable_3": "true",
+            "mDataProp_4": "4",
+            "sSearch_4": "",
+            "bRegex_4": "false",
+            "bSearchable_4": "true",
+            "bSortable_4": "true",
+            "mDataProp_5": "5",
+            "sSearch_5": "",
+            "bRegex_5": "false",
+            "bSearchable_5": "true",
+            "bSortable_5": "true",
+            "mDataProp_6": "6",
+            "sSearch_6": "",
+            "bRegex_6": "false",
+            "bSearchable_6": "true",
+            "bSortable_6": "true",
+            "sSearch": "",
+            "bRegex": "false",
             "iSortCol_0": "0",
             "sSortDir_0": "desc",
             "iSortingCols": "1",
             "_": str(int(time.time() * 1000)),
         }
         
+        # EXACT headers from successful API call
         headers = {
-            "Referer": urljoin(BASE_URL, "/client/SMSDashboard"),
-            "X-Requested-With": "XMLHttpRequest",
             "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": f"{BASE_URL}/client/SMSDashboard",
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache",
         }
-        
-        log.info("🔍 Fetching SMS data from: %s", DATA_URL)
-        log.info("📋 Fetch params: %s", {k: v for k, v in params.items() if not k.startswith('_')})
-        log.info("🔐 Current cookies: %s", session.cookies.get_dict())
+
+        log.info("Fetching SMS data from: %s", DATA_URL)
         
         r = session.get(DATA_URL, params=params, headers=headers, timeout=20)
         
-        log.info("📡 Fetch status: %d", r.status_code)
-        log.info("📄 Content-Type: %s", r.headers.get("Content-Type"))
-        
-        # Save the response for inspection
-        save_debug_html(r.text, "api_response.html")
+        log.info("Fetch status: %d", r.status_code)
+        log.info("Content-Type: %s", r.headers.get("Content-Type"))
         
         if r.status_code != 200:
-            log.warning("❌ Fetch failed with status: %d", r.status_code)
-            if r.status_code in [401, 403]:
-                log.error("🔐 Authentication issue - session may have expired")
+            log.warning("Fetch failed with status: %d", r.status_code)
             return []
             
-        # Check if response is JSON
+        # Check response content
         content = r.text.strip()
-        if content.startswith('{') or content.startswith('['):
-            try:
-                data = r.json()
-                log.info("✅ Got JSON response with keys: %s", list(data.keys()) if isinstance(data, dict) else "array")
-                return data.get("aaData", []) if isinstance(data, dict) else data
-            except json.JSONDecodeError:
-                log.error("❌ Failed to parse JSON")
-                log.debug("Response start: %s", content[:500])
-                return []
-        else:
-            log.warning("❌ Response is HTML, not JSON")
-            if "login" in content.lower():
-                log.error("🔐 Got login page - session expired")
-            elif "cloudflare" in content.lower():
-                log.error("🛡️ Cloudflare protection detected")
+        
+        # Parse JSON response
+        try:
+            data = r.json()
+            if isinstance(data, dict) and "aaData" in data:
+                log.info("✅ SUCCESS! Got %d SMS records", len(data["aaData"]))
+                return data["aaData"]
+            else:
+                log.info("Got JSON response: %s", list(data.keys()) if isinstance(data, dict) else type(data))
+                return data if isinstance(data, list) else []
+        except json.JSONDecodeError as e:
+            log.error("JSON parse failed: %s", e)
+            # Check if we got HTML instead
+            if content.startswith('<!DOCTYPE html>') or content.startswith('<html'):
+                log.error("Got HTML instead of JSON - session may have expired")
+                if 'login' in content.lower():
+                    log.error("Confirmed: Got login page")
+                return "SESSION_EXPIRED"
             return []
             
     except Exception as e:
-        log.exception("💥 Fetch exception: %s", e)
+        log.exception("Fetch exception: %s", e)
         return []
 
-# --- dedupe and forward (unchanged) ---
+# --- Forwarding ---
 def already_seen_id(mid):
     return mid in seen
 
@@ -375,55 +323,49 @@ def format_and_forward(row):
         f"💬 {message}"
     )
     send_telegram(text)
-    mark_seen_id(mid, {"ts": ts, "num": number, "otp": otp})
+    mark_seen_id(mid)
     log.info("📤 Forwarded %s (%s)", number, otp)
 
-# --- main loop ---
+# --- Main loop ---
 def main_loop():
     if not BOT_TOKEN or not CHAT_IDS:
-        log.error("❌ Missing BOT_TOKEN or CHAT_IDS")
+        log.error("Missing BOT_TOKEN or CHAT_IDS")
         return
     if not IMS_USERNAME or not IMS_PASSWORD:
-        log.error("❌ Missing IMS_USERNAME / IMS_PASSWORD")
+        log.error("Missing IMS_USERNAME / IMS_PASSWORD")
         return
 
-    login_attempts = 0
-    max_login_attempts = 3
-    
     while True:
         try:
-            if login_attempts >= max_login_attempts:
-                log.error("🔴 Too many login failures, waiting 5 minutes")
-                time.sleep(300)
-                login_attempts = 0
-                
             if not ims_login():
-                login_attempts += 1
-                log.error("🔴 Login failed (%d/%d) - waiting 60s", login_attempts, max_login_attempts)
+                log.error("Login failed - waiting 60s")
                 time.sleep(60)
                 continue
-                
-            login_attempts = 0
+
             log.info("🚀 Starting SMS polling (interval: %ds)", POLL_INTERVAL)
             
+            # Poll loop
             while True:
-                rows = fetch_sms(minutes_back=15)
-                log.info("📨 Fetched %d SMS records", len(rows))
+                result = fetch_sms(minutes_back=15)
                 
-                if rows:
-                    for i, row in enumerate(rows):
+                # Handle session expiration
+                if result == "SESSION_EXPIRED":
+                    log.warning("Session expired - reconnecting...")
+                    break
+                
+                # Process SMS records
+                if result and isinstance(result, list):
+                    for row in result:
                         if isinstance(row, list):
                             format_and_forward(row)
-                        else:
-                            log.warning("Unexpected row format: %s", type(row))
                 
                 time.sleep(POLL_INTERVAL)
                 
         except KeyboardInterrupt:
-            log.info("⏹️ Interrupted by user")
+            log.info("Interrupted by user")
             break
         except Exception:
-            log.exception("💥 Main loop error - restarting in 30s")
+            log.exception("Main loop error - restarting in 30s")
             time.sleep(30)
 
 if __name__ == "__main__":
