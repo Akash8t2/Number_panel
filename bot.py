@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IMS SMS Forwarder - robust login + cookie/CSRF handling
-Fixes:
- - correctly resolves relative form actions (urljoin)
- - posts login with Referer/Origin/X-Requested-With headers
- - collects hidden inputs / CSRF / math captcha answers automatically
- - logs helpful snippets on 403 so you can see Cloudflare/HTML challenge
- - non-fatal Mongo handling
- - safe JSON fetch for data_smscdr.php
+IMS SMS Forwarder - DEBUG VERSION
+Enhanced logging to diagnose authentication issues
 """
 
 import os
@@ -24,15 +18,9 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
-# optional pymongo import
-try:
-    from pymongo import MongoClient
-except Exception:
-    MongoClient = None
-
 # --- config via env ---
 BASE_URL = os.getenv("BASE_URL", "https://imssms.org").rstrip("/")
-LOGIN_PATH = os.getenv("LOGIN_PATH", "/login")            # usually "/login"
+LOGIN_PATH = os.getenv("LOGIN_PATH", "/login")
 DATA_API_PATH = os.getenv("IMSSMS_DATA_API_PATH", "/client/res/data_smscdr.php")
 LOGIN_URL = urljoin(BASE_URL, LOGIN_PATH)
 DATA_URL = urljoin(BASE_URL, DATA_API_PATH)
@@ -44,42 +32,34 @@ CHAT_IDS = [c.strip() for c in CHAT_IDS_RAW.split(",") if c.strip()]
 IMS_USERNAME = os.getenv("IMS_USERNAME") or os.getenv("IMS_USER") or os.getenv("IMS_LOGIN")
 IMS_PASSWORD = os.getenv("IMS_PASSWORD") or os.getenv("IMS_PASS")
 
-MONGO_URI = os.getenv("MONGO_URI") or os.getenv("IMSSMS_MONGO_URI") or ""
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "15"))
 STATE_FILE = os.getenv("STATE_FILE", "seen_imssms.json")
 
-# --- logging ---
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-log = logging.getLogger("imssms-fixed")
+# --- enhanced logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+)
+log = logging.getLogger("imssms-debug")
 
-# --- session default headers ---
+# --- session with better headers ---
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
 })
 
 # regex
 OTP_RE = re.compile(r"\b\d{3,8}\b")
 MATH_Q_RE = re.compile(r'What is\s*([0-9]+)\s*([+\-xX*\/])\s*([0-9]+)', re.I)
-
-# Mongo setup (non-fatal)
-use_mongo = False
-mongo_col = None
-if MONGO_URI and MongoClient:
-    try:
-        mc = MongoClient(MONGO_URI, serverSelectionTimeoutMS=4000)
-        mc.server_info()
-        db = mc.get_database("imssms_bot")
-        mongo_col = db.get_collection("messages")
-        mongo_col.create_index("msg_id", unique=True)
-        use_mongo = True
-        log.info("✅ MongoDB connected")
-    except Exception as e:
-        log.warning("MongoDB connection failed (continuing without it): %s", e)
-else:
-    if MONGO_URI:
-        log.warning("MONGO_URI provided but pymongo not installed - ignoring Mongo")
 
 # --- seen local store ---
 def load_seen():
@@ -132,124 +112,164 @@ def send_telegram(msg: str):
         except Exception as e:
             log.warning("Telegram send exception: %s", e)
 
-# --- robust login that resolves relative actions and posts hidden inputs ---
-def ims_login(max_attempts=3):
+# --- DEBUG: Save response to file for inspection ---
+def save_debug_html(content, filename):
+    try:
+        with open(f"/tmp/{filename}", "w", encoding="utf-8") as f:
+            f.write(content)
+        log.info("💾 DEBUG: Saved %s", filename)
+    except Exception as e:
+        log.warning("Could not save debug file: %s", e)
+
+# --- Enhanced login with detailed debugging ---
+def ims_login(max_attempts=2):
     if not IMS_USERNAME or not IMS_PASSWORD:
         log.error("IMS_USERNAME / IMS_PASSWORD not set")
         return False
 
     attempt = 0
-    backoff = 5
     while attempt < max_attempts:
         attempt += 1
         try:
-            log.info("GET login page: %s", LOGIN_URL)
-            r = session.get(LOGIN_URL, timeout=15)
-            # If returned 403, likely server block or Cloudflare
+            log.info("🔍 GET login page: %s", LOGIN_URL)
+            r = session.get(LOGIN_URL, timeout=20)
+            
+            log.info("📄 Login page status: %d", r.status_code)
+            log.info("🍪 Initial cookies: %s", session.cookies.get_dict())
+            
+            # Save login page for inspection
+            save_debug_html(r.text, "login_page.html")
+            
             if r.status_code == 403:
-                log.error("Login GET returned 403 Forbidden. Response snippet:\n%s", (r.text or "")[:800])
+                log.error("❌ Login GET 403 Forbidden")
+                log.error("Response headers: %s", dict(r.headers))
                 return False
+                
             r.raise_for_status()
-            soup = BeautifulSoup(r.text or "", "html.parser")
+            soup = BeautifulSoup(r.text, "html.parser")
 
-            # find <form> (prefer form with input names)
+            # Find form and extract all inputs
             form = soup.find("form")
-            action = form.get("action") if form and form.get("action") else LOGIN_URL
-            action_url = urljoin(LOGIN_URL, action)
+            if not form:
+                log.error("❌ No form found on login page")
+                save_debug_html(r.text, "no_form_page.html")
+                return False
 
-            # gather form fields (including hidden tokens)
+            action = form.get("action", "")
+            method = form.get("method", "post").lower()
+            action_url = urljoin(LOGIN_URL, action)
+            
+            log.info("📝 Form action: %s (method: %s)", action_url, method)
+
+            # Extract all form fields
             payload = {}
             username_field = None
             password_field = None
-            if form:
-                for inp in form.find_all("input"):
-                    name = inp.get("name")
-                    typ = (inp.get("type") or "text").lower()
-                    if not name:
-                        continue
-                    # detect username/password field heuristically
-                    lname = name.lower()
-                    if typ in ("text",) and (("user" in lname) or ("email" in lname) or ("login" in lname)) and not username_field:
-                        username_field = name
-                    if typ in ("password",) and not password_field:
-                        password_field = name
-                    # include existing value for hidden fields
-                    if typ in ("hidden",):
-                        payload[name] = inp.get("value", "")
+            
+            for inp in form.find_all("input"):
+                name = inp.get("name")
+                value = inp.get("value", "")
+                inp_type = (inp.get("type") or "text").lower()
+                
+                if not name:
+                    continue
+                    
+                # Identify username/password fields
+                lname = name.lower()
+                if inp_type == "text" and any(x in lname for x in ["user", "email", "login"]):
+                    username_field = name
+                elif inp_type == "password":
+                    password_field = name
+                
+                # Include hidden fields
+                if inp_type == "hidden":
+                    payload[name] = value
+                    log.info("🔍 Hidden field: %s = %s", name, value[:50] + "..." if len(value) > 50 else value)
 
-            # fallback common names
+            # Fallback to common field names
             if not username_field:
                 username_field = "username"
             if not password_field:
                 password_field = "password"
+                
             payload[username_field] = IMS_USERNAME
             payload[password_field] = IMS_PASSWORD
 
-            # try math captcha if present on page text
-            math_answer = solve_math(soup.get_text(" ", strip=True))
-            if math_answer is not None:
-                # common field names for captcha/answer
-                for field in ("captcha", "answer", "math", "verification"):
-                    if field not in payload:
-                        payload.setdefault(field, math_answer)
+            log.info("👤 Username field: %s", username_field)
+            log.info("🔒 Password field: %s", password_field)
 
-            # set headers for POST: include Origin & Referer & X-Requested-With
+            # Check for math captcha
+            math_answer = solve_math(soup.get_text())
+            if math_answer:
+                log.info("🧮 Math captcha detected: answer = %s", math_answer)
+                # Try common captcha field names
+                for field in ["captcha", "answer", "verification", "math"]:
+                    if field not in payload:
+                        payload[field] = math_answer
+                        log.info("📝 Added math answer to field: %s", field)
+                        break
+
+            log.info("📦 Final payload keys: %s", list(payload.keys()))
+
+            # Prepare POST request
             headers = {
                 "Referer": LOGIN_URL,
                 "Origin": BASE_URL,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "X-Requested-With": "XMLHttpRequest",
-                "User-Agent": session.headers.get("User-Agent"),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
             }
 
-            log.info("POST login to: %s (attempt %d)", action_url, attempt)
-            post = session.post(action_url, data=payload, headers=headers, allow_redirects=True, timeout=20)
+            log.info("🚀 POST login to: %s", action_url)
+            if method == "get":
+                post_resp = session.get(action_url, params=payload, headers=headers, allow_redirects=True, timeout=20)
+            else:
+                post_resp = session.post(action_url, data=payload, headers=headers, allow_redirects=True, timeout=20)
 
-            # if 403 on POST, log and stop attempts (likely anti-bot)
-            if post.status_code == 403:
-                log.error("Login POST returned 403 Forbidden. Response snippet:\n%s", (post.text or "")[:1000])
-                # if it's Cloudflare or JS challenge, no simple script will pass it; need headless browser or manual cookie
-                return False
+            log.info("📨 Login POST status: %d", post_resp.status_code)
+            log.info("🔐 Cookies after login: %s", session.cookies.get_dict())
+            
+            # Save login response for inspection
+            save_debug_html(post_resp.text, "login_response.html")
 
-            # check if we got a session cookie or dashboard success
-            log.info("Login POST status: %s", post.status_code)
-            log.info("Cookies after login: %s", session.cookies.get_dict())
+            # Test dashboard access
+            dashboard_url = urljoin(BASE_URL, "/client/SMSDashboard")
+            log.info("🔍 Testing dashboard access: %s", dashboard_url)
+            dash_resp = session.get(dashboard_url, timeout=15)
+            
+            log.info("📊 Dashboard status: %d", dash_resp.status_code)
+            save_debug_html(dash_resp.text, "dashboard.html")
 
-            # try to load dashboard to ensure we have a valid session
-            dash = session.get(urljoin(BASE_URL, "/client/SMSDashboard"), timeout=15)
-            log.info("Dashboard GET status: %s", dash.status_code)
-            if dash.status_code == 200 and "SMSDashboard" in (dash.text or ""):
-                log.info("Login appears successful (dashboard reachable)")
+            # Check for success indicators
+            success_indicators = [
+                "SMSDashboard" in dash_resp.text,
+                "logout" in dash_resp.text.lower(),
+                "dashboard" in dash_resp.text.lower(),
+                session.cookies.get_dict()  # Has cookies
+            ]
+            
+            if any(success_indicators):
+                log.info("✅ Login successful!")
                 return True
-
-            # some sites redirect to a different path after login; treat 200/302 as potential success
-            if post.status_code in (200, 302):
-                # small heuristic: if session cookie present and dashboard redirects
-                if session.cookies.get_dict():
-                    log.info("Login likely OK (cookies present).")
-                    return True
-
-            # otherwise retry after backoff
-            log.warning("Login attempt didn't confirm dashboard; retrying after %ds", backoff)
-            time.sleep(backoff)
-            backoff *= 2
-        except requests.exceptions.RequestException as e:
-            log.exception("Network/login request failed (attempt %d): %s", attempt, e)
-            time.sleep(backoff)
-            backoff *= 2
-        except Exception:
-            log.exception("Unexpected error during login")
-            time.sleep(backoff)
-            backoff *= 2
-    log.error("Exceeded max login attempts")
+            else:
+                log.warning("⚠️ Login may have failed - no clear success indicators")
+                if "login" in dash_resp.text.lower():
+                    log.error("❌ Still seeing login page - credentials may be wrong")
+                
+        except Exception as e:
+            log.exception("💥 Login attempt %d failed: %s", attempt, e)
+            time.sleep(5)
+            
+    log.error("❌ All login attempts failed")
     return False
 
-# --- fetch function with proper Referer and JSON-safe handling ---
+# --- Enhanced fetch with detailed debugging ---
 def fetch_sms(minutes_back=15):
     try:
         now = datetime.now(timezone.utc)
         f1 = (now - timedelta(minutes=minutes_back)).strftime("%Y-%m-%d %H:%M:%S")
         f2 = now.strftime("%Y-%m-%d %H:%M:%S")
+        
         params = {
             "fdate1": f1,
             "fdate2": f2,
@@ -272,60 +292,63 @@ def fetch_sms(minutes_back=15):
             "iSortingCols": "1",
             "_": str(int(time.time() * 1000)),
         }
+        
         headers = {
             "Referer": urljoin(BASE_URL, "/client/SMSDashboard"),
             "X-Requested-With": "XMLHttpRequest",
             "Accept": "application/json, text/javascript, */*; q=0.01",
         }
-        r = session.get(DATA_URL, params=params, headers=headers, timeout=15)
-        log.debug("Fetch status: %s; content-type: %s", r.status_code, r.headers.get("Content-Type"))
-        snippet = (r.text or "")[:800].replace("\n", " ")
-        log.debug("Fetch snippet: %s", snippet)
+        
+        log.info("🔍 Fetching SMS data from: %s", DATA_URL)
+        log.info("📋 Fetch params: %s", {k: v for k, v in params.items() if not k.startswith('_')})
+        log.info("🔐 Current cookies: %s", session.cookies.get_dict())
+        
+        r = session.get(DATA_URL, params=params, headers=headers, timeout=20)
+        
+        log.info("📡 Fetch status: %d", r.status_code)
+        log.info("📄 Content-Type: %s", r.headers.get("Content-Type"))
+        
+        # Save the response for inspection
+        save_debug_html(r.text, "api_response.html")
+        
         if r.status_code != 200:
-            log.warning("Fetch non-200: %s", r.status_code)
-            # If 403/HTML, session probably expired -> force re-login upstream
+            log.warning("❌ Fetch failed with status: %d", r.status_code)
+            if r.status_code in [401, 403]:
+                log.error("🔐 Authentication issue - session may have expired")
             return []
-        # only parse JSON if content-type indicates JSON or starts with {
-        ct = r.headers.get("Content-Type", "")
-        if ct.startswith("application/json") or (r.text and r.text.strip().startswith("{")):
+            
+        # Check if response is JSON
+        content = r.text.strip()
+        if content.startswith('{') or content.startswith('['):
             try:
-                j = r.json()
-                return j.get("aaData", []) if isinstance(j, dict) else []
-            except Exception:
-                log.exception("JSON parse failed; snippet: %s", snippet)
+                data = r.json()
+                log.info("✅ Got JSON response with keys: %s", list(data.keys()) if isinstance(data, dict) else "array")
+                return data.get("aaData", []) if isinstance(data, dict) else data
+            except json.JSONDecodeError:
+                log.error("❌ Failed to parse JSON")
+                log.debug("Response start: %s", content[:500])
                 return []
         else:
-            log.warning("Fetch returned HTML (not JSON); snippet: %s", snippet)
+            log.warning("❌ Response is HTML, not JSON")
+            if "login" in content.lower():
+                log.error("🔐 Got login page - session expired")
+            elif "cloudflare" in content.lower():
+                log.error("🛡️ Cloudflare protection detected")
             return []
-    except Exception:
-        log.exception("Fetch exception")
+            
+    except Exception as e:
+        log.exception("💥 Fetch exception: %s", e)
         return []
 
-# --- dedupe helpers ---
+# --- dedupe and forward (unchanged) ---
 def already_seen_id(mid):
-    if use_mongo and mongo_col:
-        try:
-            return mongo_col.find_one({"msg_id": mid}) is not None
-        except Exception:
-            log.exception("Mongo read error")
-            return False
     return mid in seen
 
 def mark_seen_id(mid, payload=None):
-    if use_mongo and mongo_col:
-        try:
-            doc = {"msg_id": mid}
-            if payload:
-                doc["payload"] = payload
-            mongo_col.insert_one(doc)
-            return
-        except Exception:
-            log.exception("Mongo insert error")
     seen.add(mid)
+    save_seen(seen)
 
-# --- format + forward ---
 def format_and_forward(row):
-    # aaData row expected: [timestamp, operator, number, service, message, client, ...]
     try:
         ts = row[0] if len(row) > 0 else ""
         operator = row[1] if len(row) > 1 else ""
@@ -353,38 +376,54 @@ def format_and_forward(row):
     )
     send_telegram(text)
     mark_seen_id(mid, {"ts": ts, "num": number, "otp": otp})
-    log.info("Forwarded %s (%s)", number, otp)
+    log.info("📤 Forwarded %s (%s)", number, otp)
 
-# --- main loop (with login retry/backoff) ---
+# --- main loop ---
 def main_loop():
     if not BOT_TOKEN or not CHAT_IDS:
-        log.error("Missing BOT_TOKEN or CHAT_IDS (IMSSMS_BOT_TOKEN / IMSSMS_CHAT_IDS)")
+        log.error("❌ Missing BOT_TOKEN or CHAT_IDS")
         return
     if not IMS_USERNAME or not IMS_PASSWORD:
-        log.error("Missing IMS_USERNAME / IMS_PASSWORD")
+        log.error("❌ Missing IMS_USERNAME / IMS_PASSWORD")
         return
 
-    # outer retry to keep process alive
+    login_attempts = 0
+    max_login_attempts = 3
+    
     while True:
         try:
+            if login_attempts >= max_login_attempts:
+                log.error("🔴 Too many login failures, waiting 5 minutes")
+                time.sleep(300)
+                login_attempts = 0
+                
             if not ims_login():
-                log.error("Login failed - sleeping 60s before retry")
+                login_attempts += 1
+                log.error("🔴 Login failed (%d/%d) - waiting 60s", login_attempts, max_login_attempts)
                 time.sleep(60)
                 continue
-
-            log.info("🚀 Polling started (api=%s)", DATA_URL)
+                
+            login_attempts = 0
+            log.info("🚀 Starting SMS polling (interval: %ds)", POLL_INTERVAL)
+            
             while True:
                 rows = fetch_sms(minutes_back=15)
+                log.info("📨 Fetched %d SMS records", len(rows))
+                
                 if rows:
-                    for r in rows:
-                        if isinstance(r, list):
-                            format_and_forward(r)
+                    for i, row in enumerate(rows):
+                        if isinstance(row, list):
+                            format_and_forward(row)
+                        else:
+                            log.warning("Unexpected row format: %s", type(row))
+                
                 time.sleep(POLL_INTERVAL)
+                
         except KeyboardInterrupt:
-            log.info("Interrupted by user")
+            log.info("⏹️ Interrupted by user")
             break
         except Exception:
-            log.exception("Main loop error - will retry login after short sleep")
+            log.exception("💥 Main loop error - restarting in 30s")
             time.sleep(30)
 
 if __name__ == "__main__":
