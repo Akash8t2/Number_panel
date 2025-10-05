@@ -24,7 +24,7 @@ POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "2"))
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "15"))
 STATE_FILE = "seen.json"
 
-LOGIN_URL = f"{SITE_BASE}/ints/login"
+LOGIN_URL = f"{SITE_BASE}/"
 SIGNIN_URL = f"{SITE_BASE}/ints/signin"
 DATA_API_URL = f"{SITE_BASE}/ints/agent/res/data_smscdr.php"
 DASH_URL = f"{SITE_BASE}/ints/agent/SMSCDRStats"
