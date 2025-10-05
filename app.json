@@ -45,8 +45,5 @@
   },
   "buildpacks": [
     { "url": "heroku/python" }
-  ],
-  "addons": [
-    { "plan": "heroku-mongo" }
   ]
 }
