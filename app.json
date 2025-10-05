@@ -1,44 +1,40 @@
 {
-  "name": "OTP Forwarder with MongoDB (No Duplicates)",
-  "description": "Auto-forward OTP messages from IMS site to Telegram with MongoDB deduplication and restart-safe cache.",
-  "repository": "https://github.com/your-repo-name/otp-forwarder",
-  "logo": "https://i.ibb.co/6XvnYtM/otpbot.png",
-  "keywords": ["telegram", "otp", "heroku", "bot", "mongo"],
+  "name": "IMS-OTP-Forwarder",
+  "description": "Fetch OTPs from imssms.org and forward them to a Telegram group automatically.",
+  "repository": "https://github.com/akashkashyap/ims-otp-forwarder",
+  "keywords": ["otp", "telegram", "ims", "scraper", "heroku", "forwarder"],
   "env": {
     "BOT_TOKEN": {
-      "description": "Your Telegram Bot Token from @BotFather",
+      "description": "Your Telegram Bot token from @BotFather",
       "required": true
     },
-    "CHAT_IDS": {
-      "description": "Comma-separated list of chat/group IDs where OTPs should be sent (e.g. -1001234567890,123456789)",
+    "CHAT_ID": {
+      "description": "Telegram chat/group ID where OTPs will be sent",
+      "value": "-1003140739791"
+    },
+    "IMS_URL": {
+      "description": "IMS SMS Dashboard URL",
+      "value": "https://imssms.org/client/SMSDashboard"
+    },
+    "IMS_USER": {
+      "description": "IMS login username",
       "required": true
     },
-    "USERNAME": {
-      "description": "IMS panel login username",
+    "IMS_PASS": {
+      "description": "IMS login password",
       "required": true
-    },
-    "PASSWORD": {
-      "description": "IMS panel login password",
-      "required": true
-    },
-    "SITE_BASE": {
-      "description": "Base site URL (default: http://45.82.67.20)",
-      "required": false,
-      "value": "http://45.82.67.20"
     },
     "MONGO_URI": {
-      "description": "MongoDB connection URI (optional, for deduplication persistence)",
-      "required": false
+      "description": "MongoDB connection string for deduplication and logs",
+      "value": "mongodb+srv://BrandedSupportGroup:BRANDED_WORLD@cluster0.v4odcq9.mongodb.net/?retryWrites=true&w=majority"
     },
-    "POLL_INTERVAL": {
-      "description": "Polling interval in seconds (default: 2)",
-      "required": false,
-      "value": "2"
-    },
-    "REQUEST_TIMEOUT": {
-      "description": "Request timeout in seconds (default: 15)",
-      "required": false,
+    "FETCH_INTERVAL": {
+      "description": "Seconds between SMS fetches (recommended 10–30)",
       "value": "15"
+    },
+    "ADMIN_ID": {
+      "description": "Telegram user ID of the admin (for control commands)",
+      "required": false
     }
   },
   "formation": {
@@ -48,11 +44,9 @@
     }
   },
   "buildpacks": [
-    {
-      "url": "heroku/python"
-    }
+    { "url": "heroku/python" }
   ],
-  "scripts": {
-    "postdeploy": "echo '✅ Deployment complete. Your OTP Forwarder bot is now running.'"
-  }
+  "addons": [
+    { "plan": "heroku-mongo" }
+  ]
 }
