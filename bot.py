@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IMS SMS Forwarder - COMPLETE WORKING VERSION
-Forwards OTP messages from IMS SMS to Telegram
+IMS SMS Forwarder - UPDATED VERSION
+Country flags and live OTP filtering
 """
 
 import os
@@ -58,6 +58,30 @@ OTP_PATTERNS = [
     r'\b\d{3,8}\b',          # fallback: any 3-8 digit number
 ]
 
+# Country mapping from operator names
+COUNTRY_FLAGS = {
+    # Venezuela
+    "venezuela": "🇻🇪 Venezuela",
+    "movilnet": "🇻🇪 Venezuela",
+    
+    # Italy
+    "italy": "🇮🇹 Italy", 
+    "wind": "🇮🇹 Italy",
+    "heg": "🇮🇹 Italy",
+    
+    # Kazakhstan
+    "kazakhstan": "🇰🇿 Kazakhstan",
+    
+    # Kyrgyzstan
+    "kyrgyzstan": "🇰🇬 Kyrgyzstan",
+    
+    # Togo
+    "togo": "🇹🇬 Togo",
+    
+    # Default fallbacks
+    "default": "🌍 Unknown"
+}
+
 # In-memory seen storage (Heroku has ephemeral filesystem)
 seen_messages = set()
 
@@ -108,8 +132,43 @@ def extract_otp(message: str) -> str:
     
     return "N/A"
 
+# --- Map operator to country with flag ---
+def get_country_from_operator(operator: str) -> str:
+    """Convert operator name to country with flag"""
+    if not operator:
+        return COUNTRY_FLAGS["default"]
+    
+    operator_lower = operator.lower()
+    
+    # Check for country matches
+    for country_key, country_value in COUNTRY_FLAGS.items():
+        if country_key in operator_lower and country_key != "default":
+            return country_value
+    
+    # Default fallback
+    return COUNTRY_FLAGS["default"]
+
+# --- Check if SMS is recent (within 10 minutes) ---
+def is_recent_sms(timestamp_str: str, max_minutes_ago: int = 10) -> bool:
+    """Check if SMS timestamp is within the last max_minutes_ago minutes"""
+    try:
+        # Parse the timestamp (format: "2025-10-06 15:48:42")
+        sms_time = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+        current_time = datetime.now()
+        
+        # Calculate time difference
+        time_diff = current_time - sms_time
+        time_diff_minutes = time_diff.total_seconds() / 60
+        
+        # Return True if within the allowed time window
+        return time_diff_minutes <= max_minutes_ago
+        
+    except Exception as e:
+        log.warning("Failed to parse timestamp '%s': %s", timestamp_str, e)
+        return False  # If we can't parse, assume it's not recent
+
 # --- Fetch SMS with comprehensive data detection ---
-def fetch_sms(minutes_back=60):
+def fetch_sms(minutes_back=10):  # Reduced to 10 minutes for live OTPs only
     """Fetch SMS data from IMS SMS API"""
     try:
         now = datetime.now(timezone.utc)
@@ -185,7 +244,7 @@ def fetch_sms(minutes_back=60):
             "Pragma": "no-cache",
         }
 
-        log.info("📡 Fetching SMS data from last %d minutes", minutes_back)
+        log.info("📡 Fetching LIVE SMS data from last %d minutes", minutes_back)
         r = session.get(DATA_URL, params=params, headers=headers, timeout=20)
         
         log.info("📊 API Response: %d %s", r.status_code, r.reason)
@@ -212,18 +271,23 @@ def fetch_sms(minutes_back=60):
                         # Skip footer rows and invalid data
                         if (number and not number.startswith("0,0,0") and 
                             message and len(number) >= 3):
-                            valid_sms.append(row)
+                            
+                            # Check if SMS is recent (within 10 minutes)
+                            if is_recent_sms(timestamp, max_minutes_ago=10):
+                                valid_sms.append(row)
+                            else:
+                                log.debug("Skipping old SMS from %s: %s", number, timestamp)
                         else:
                             log.debug("Skipping invalid row %d: %s", i, row[:3])
                     else:
                         log.debug("Skipping malformed row %d: %s", i, row)
                 
-                log.info("✅ Found %d valid SMS records", len(valid_sms))
+                log.info("✅ Found %d LIVE SMS records (last 10 minutes)", len(valid_sms))
                 
                 # Log sample for debugging
                 if valid_sms:
                     sample = valid_sms[0]
-                    log.info("📝 Sample: %s | %s | %s", 
+                    log.info("📝 Live Sample: %s | %s | %s", 
                             sample[0] if len(sample) > 0 else "N/A",
                             sample[2] if len(sample) > 2 else "N/A", 
                             (sample[4][:80] + "...") if len(sample) > 4 and len(sample[4]) > 80 else 
@@ -266,6 +330,11 @@ def process_sms(row):
             log.debug("Skipping invalid SMS row")
             return False
             
+        # Double-check timestamp is recent
+        if not is_recent_sms(ts, max_minutes_ago=10):
+            log.debug("Skipping old message from %s: %s", number, ts)
+            return False
+            
     except Exception as e:
         log.warning("Failed to parse SMS row: %s - %s", row, e)
         return False
@@ -281,22 +350,24 @@ def process_sms(row):
     # Extract OTP code
     otp_code = extract_otp(message)
     
-    # Format Telegram message
+    # Get country with flag from operator
+    country = get_country_from_operator(operator)
+    
+    # Format Telegram message (WITHOUT SOURCE)
     telegram_msg = (
         f"✅ *New OTP Received* ✅\n\n"
         f"🕰 *Time:* `{ts}`\n"
         f"📞 *Number:* `{number}`\n"
         f"🔢 *OTP Code:* `{otp_code}`\n"
-        f"🌍 *Operator:* {operator}\n"
+        f"{country}\n"
         f"📱 *Service:* {service}\n\n"
-        f"💬 *Message:*\n`{message}`\n\n"
-        f"🔗 *Source:* {BASE_URL}"
+        f"💬 *Message:*\n`{message}`"
     )
     
     # Send to Telegram
     if send_telegram(telegram_msg):
         seen_messages.add(message_id)
-        log.info("📤 Forwarded OTP from %s: %s", number, otp_code)
+        log.info("📤 Forwarded LIVE OTP from %s: %s", number, otp_code)
         return True
     else:
         log.error("❌ Failed to send Telegram message for %s", number)
@@ -336,8 +407,8 @@ def main_loop():
         log.error("3. Run: heroku config:set MANUAL_SESSION=your_phpsessid_value")
         return
 
-    log.info("🚀 Starting IMS SMS Forwarder")
-    log.info("📞 Monitoring for OTP messages...")
+    log.info("🚀 Starting IMS SMS Forwarder - LIVE OTP MODE")
+    log.info("📞 Monitoring for LIVE OTP messages (last 10 minutes only)")
     log.info("⏰ Polling interval: %d seconds", POLL_INTERVAL)
     log.info("👥 Telegram chats: %s", CHAT_IDS)
     
@@ -350,8 +421,8 @@ def main_loop():
     
     while True:
         try:
-            # Fetch SMS data
-            result = fetch_sms(minutes_back=60)
+            # Fetch SMS data (only last 10 minutes for live OTPs)
+            result = fetch_sms(minutes_back=10)
             
             # Handle different result types
             if result in ["SESSION_EXPIRED", "NETWORK_ERROR", "ERROR"]:
@@ -382,11 +453,11 @@ def main_loop():
                         processed_count += 1
                 
                 if processed_count > 0:
-                    log.info("📨 Successfully processed %d new OTP messages", processed_count)
+                    log.info("📨 Successfully processed %d LIVE OTP messages", processed_count)
                 else:
-                    log.info("⏳ No new OTP messages found in this check")
+                    log.info("⏳ No new LIVE OTP messages found")
             else:
-                log.info("⏳ No SMS data to process")
+                log.info("⏳ No LIVE SMS data to process")
             
             # Wait for next poll
             time.sleep(POLL_INTERVAL)
