@@ -1,39 +1,40 @@
 {
-  "name": "IMS-OTP-Forwarder",
-  "description": "Fetch OTPs from imssms.org and forward them to a Telegram group automatically.",
-  "repository": "https://github.com/akashkashyap/ims-otp-forwarder",
-  "keywords": ["otp", "telegram", "ims", "scraper", "heroku", "forwarder"],
+  "name": "OTP Sentinel",
+  "description": "🛡️ Your Guardian for Verification Codes - Forward OTP messages from IMS SMS to Telegram",
+  "repository": "https://github.com/your-username/otp-sentinel",
+  "logo": "https://raw.githubusercontent.com/your-username/otp-sentinel/main/assets/logo.png",
+  "keywords": [
+    "python",
+    "telegram",
+    "bot",
+    "otp",
+    "sms",
+    "verification",
+    "security",
+    "automation"
+  ],
+  "website": "https://t.me/OTPSentinelBot",
   "env": {
-    "BOT_TOKEN": {
-      "description": "Your Telegram Bot token from @BotFather",
+    "IMSSMS_BOT_TOKEN": {
+      "description": "Your Telegram Bot Token from @BotFather",
       "required": true
     },
-    "CHAT_ID": {
-      "description": "Telegram chat/group ID where OTPs will be sent",
-      "value": "-1003140739791"
-    },
-    "IMS_URL": {
-      "description": "IMS SMS Dashboard URL",
-      "value": "https://imssms.org/client/SMSDashboard"
-    },
-    "IMS_USER": {
-      "description": "IMS login username",
+    "IMSSMS_CHAT_IDS": {
+      "description": "Comma separated list of Telegram Chat IDs to receive OTPs",
       "required": true
     },
-    "IMS_PASS": {
-      "description": "IMS login password",
+    "MANUAL_SESSION": {
+      "description": "PHPSESSID cookie from IMS SMS website (get from browser after login)",
       "required": true
     },
-    "MONGO_URI": {
-      "description": "MongoDB connection string for deduplication and logs",
-      "value": "mongodb+srv://BrandedSupportGroup:BRANDED_WORLD@cluster0.v4odcq9.mongodb.net/?retryWrites=true&w=majority"
+    "BASE_URL": {
+      "description": "IMS SMS base URL",
+      "value": "https://imssms.org",
+      "required": false
     },
-    "FETCH_INTERVAL": {
-      "description": "Seconds between SMS fetches (recommended 10–30)",
-      "value": "15"
-    },
-    "ADMIN_ID": {
-      "description": "Telegram user ID of the admin (for control commands)",
+    "POLL_INTERVAL": {
+      "description": "How often to check for new OTPs (in seconds)",
+      "value": "15",
       "required": false
     }
   },
@@ -44,6 +45,13 @@
     }
   },
   "buildpacks": [
-    { "url": "heroku/python" }
+    {
+      "url": "heroku/python"
+    }
+  ],
+  "addons": [
+    {
+      "plan": "heroku-redis:mini"
+    }
   ]
 }
