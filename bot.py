@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NumberPanel OTP Sentinel - Secure OTP Forwarding
-For http://51.89.99.105/NumberPanel
+NumberPanel OTP Sentinel - Fixed Version
+Handles 404 errors and better session management
 """
 
 import os
@@ -23,12 +23,12 @@ DATA_API_PATH = os.getenv("DATA_API_PATH", "/client/res/data_smscdr.php")
 LOGIN_URL = urljoin(BASE_URL, LOGIN_PATH)
 DATA_URL = urljoin(BASE_URL, DATA_API_PATH)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_IDS_RAW = os.getenv("CHAT_IDS") or os.getenv("TELEGRAM_CHAT_IDS", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_IDS_RAW = os.getenv("CHAT_IDS", "")
 CHAT_IDS = [c.strip() for c in CHAT_IDS_RAW.split(",") if c.strip()]
 
-# Manual session cookie - GET THIS FROM NEW WEBSITE
-MANUAL_SESSION = os.getenv("MANUAL_SESSION") or os.getenv("PHPSESSID")
+# Manual session cookie
+MANUAL_SESSION = os.getenv("MANUAL_SESSION")
 
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "15"))
 
@@ -56,6 +56,9 @@ session.headers.update({
 if MANUAL_SESSION:
     session.cookies.set("PHPSESSID", MANUAL_SESSION)
     log.info("Using manual session cookie: %s...", MANUAL_SESSION[:20])
+else:
+    log.error("❌ No MANUAL_SESSION provided!")
+    exit(1)
 
 # OTP regex patterns
 OTP_PATTERNS = [
@@ -66,27 +69,16 @@ OTP_PATTERNS = [
     r'\b\d{3,8}\b',          # fallback
 ]
 
-# Country mapping from operator names for NEW website
+# Country mapping
 COUNTRY_FLAGS = {
-    # Venezuela
     "venezuela": "🇻🇪 Venezuela",
     "movilnet": "🇻🇪 Venezuela",
-    
-    # Italy
     "italy": "🇮🇹 Italy", 
     "wind": "🇮🇹 Italy",
     "heg": "🇮🇹 Italy",
-    
-    # Kazakhstan
     "kazakhstan": "🇰🇿 Kazakhstan",
-    
-    # Kyrgyzstan
     "kyrgyzstan": "🇰🇬 Kyrgyzstan",
-    
-    # Togo
     "togo": "🇹🇬 Togo",
-    
-    # Add more based on your new website's operators
     "default": "🌍 Unknown"
 }
 
@@ -102,6 +94,53 @@ SERVICE_ICONS = {
 
 # In-memory seen storage
 seen_messages = set()
+
+# --- Test API endpoint ---
+def test_api_endpoint():
+    """Test if the API endpoint is accessible"""
+    try:
+        test_params = {
+            "fdate1": "2025-10-06 00:00:00",
+            "fdate2": "2025-10-06 23:59:59", 
+            "sEcho": "1",
+            "iDisplayStart": "0",
+            "iDisplayLength": "5",
+            "_": str(int(time.time() * 1000)),
+        }
+        
+        headers = {
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": urljoin(BASE_URL, "/client/SMSDashboard"),
+        }
+        
+        log.info("🔍 Testing API endpoint: %s", DATA_URL)
+        r = session.get(DATA_URL, params=test_params, headers=headers, timeout=10)
+        
+        log.info("📊 Test Response: %d %s", r.status_code, r.reason)
+        
+        if r.status_code == 200:
+            try:
+                data = r.json()
+                log.info("✅ API test successful! Structure: %s", list(data.keys()) if isinstance(data, dict) else type(data))
+                return True
+            except json.JSONDecodeError:
+                log.info("⚠️ API returned non-JSON response")
+                return True
+        elif r.status_code == 404:
+            log.error("❌ API endpoint not found (404)")
+            log.error("💡 Possible issues:")
+            log.error("   - Wrong API path")
+            log.error("   - Session cookie expired") 
+            log.error("   - Server configuration changed")
+            return False
+        else:
+            log.error("❌ API test failed: %d", r.status_code)
+            return False
+            
+    except Exception as e:
+        log.error("❌ API test error: %s", e)
+        return False
 
 # --- Telegram send ---
 def send_telegram(msg: str):
@@ -193,81 +232,7 @@ def is_recent_sms(timestamp_str: str, max_minutes_ago: int = 10) -> bool:
         log.warning("Failed to parse timestamp '%s': %s", timestamp_str, e)
         return False
 
-# --- Auto login for new website ---
-def numberpanel_login(max_attempts=3):
-    """Login to NumberPanel website"""
-    username = os.getenv("NUMBERPANEL_USERNAME")
-    password = os.getenv("NUMBERPANEL_PASSWORD")
-    
-    if not username or not password:
-        log.info("No credentials provided, using manual session only")
-        return True  # Continue with manual session
-    
-    for attempt in range(1, max_attempts + 1):
-        try:
-            log.info("🔐 Attempting login to NumberPanel (attempt %d)", attempt)
-            r = session.get(LOGIN_URL, timeout=15)
-            
-            if r.status_code != 200:
-                log.error("Login page failed: %s", r.status_code)
-                continue
-            
-            # Parse login form
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(r.text, "html.parser")
-            form = soup.find("form")
-            
-            if not form:
-                log.error("No login form found")
-                continue
-            
-            action = form.get("action", "")
-            action_url = urljoin(LOGIN_URL, action)
-            
-            # Extract form fields
-            payload = {}
-            for inp in form.find_all("input"):
-                name = inp.get("name")
-                value = inp.get("value", "")
-                if name:
-                    payload[name] = value
-            
-            # Set credentials
-            payload["username"] = username
-            payload["password"] = password
-            
-            # Login headers
-            headers = {
-                "Referer": LOGIN_URL,
-                "Origin": BASE_URL,
-                "Content-Type": "application/x-www-form-urlencoded",
-            }
-            
-            log.info("📨 POST login to: %s", action_url)
-            post = session.post(action_url, data=payload, headers=headers, allow_redirects=True, timeout=20)
-            
-            log.info("Login POST status: %s", post.status_code)
-            log.info("Cookies after login: %s", session.cookies.get_dict())
-            
-            # Verify login
-            dashboard_url = urljoin(BASE_URL, "/client/SMSDashboard")
-            dash = session.get(dashboard_url, timeout=15)
-            
-            if dash.status_code == 200 and ("SMSDashboard" in dash.text or "Dashboard" in dash.text):
-                log.info("✅ NumberPanel login successful!")
-                return True
-            else:
-                log.warning("Dashboard verification failed")
-                continue
-                
-        except Exception as e:
-            log.exception("Login attempt %d failed: %s", attempt, e)
-            time.sleep(5)
-    
-    log.error("All login attempts failed")
-    return False
-
-# --- Fetch SMS from new website ---
+# --- Fetch SMS from NumberPanel ---
 def fetch_sms(minutes_back=10):
     """Fetch SMS data from NumberPanel API"""
     try:
@@ -344,12 +309,19 @@ def fetch_sms(minutes_back=10):
             "Pragma": "no-cache",
         }
 
-        log.info("📡 Fetching from NumberPanel (%s to %s)", f1, f2)
+        log.info("📡 Fetching from NumberPanel...")
         r = session.get(DATA_URL, params=params, headers=headers, timeout=20)
         
-        log.info("📊 API Response: %d", r.status_code)
+        log.info("📊 API Response: %d %s", r.status_code, r.reason)
         
-        if r.status_code != 200:
+        if r.status_code == 404:
+            log.error("❌ API endpoint not found (404)")
+            log.error("💡 The API path might be different. Please check:")
+            log.error("   - Login to %s", BASE_URL)
+            log.error("   - Go to SMS Dashboard")
+            log.error("   - Check Network tab for correct API endpoint")
+            return "ENDPOINT_ERROR"
+        elif r.status_code != 200:
             log.warning("❌ Fetch failed: %d", r.status_code)
             return "SESSION_EXPIRED"
             
@@ -391,13 +363,13 @@ def fetch_sms(minutes_back=10):
                 
                 return valid_sms
             else:
-                log.warning("Unexpected API response")
+                log.warning("Unexpected API response format")
                 return []
                 
         except json.JSONDecodeError as e:
             log.error("❌ JSON parse failed: %s", e)
             if r.text.strip().startswith(('<!DOCTYPE html>', '<html')):
-                log.error("🔐 Session expired")
+                log.error("🔐 Session expired - got login page")
                 return "SESSION_EXPIRED"
             log.debug("Response: %s", r.text[:300])
             return []
@@ -464,44 +436,35 @@ def process_sms(row):
         log.error("❌ Failed to send for %s", number)
         return False
 
-# --- Health check ---
-def check_session_health():
-    """Check if the current session is still valid"""
-    try:
-        test_params = {
-            "fdate1": "2025-01-01 00:00:00",
-            "fdate2": "2025-01-01 00:01:00",
-            "sEcho": "1",
-            "iDisplayStart": "0",
-            "iDisplayLength": "1",
-            "_": str(int(time.time() * 1000)),
-        }
-        
-        r = session.get(DATA_URL, params=test_params, timeout=10)
-        return r.status_code == 200 and "aaData" in r.json()
-    except:
-        return False
-
 # --- Main loop ---
 def main_loop():
     """Main application loop"""
     if not BOT_TOKEN or not CHAT_IDS:
         log.error("❌ Missing BOT_TOKEN or CHAT_IDS")
+        log.error("💡 Please set environment variables:")
+        log.error("   - BOT_TOKEN: Your Telegram bot token")
+        log.error("   - CHAT_IDS: Your Telegram chat ID")
         return
         
     if not MANUAL_SESSION:
-        log.warning("⚠️ No MANUAL_SESSION, attempting auto-login")
-        if not numberpanel_login():
-            log.error("❌ No session available")
-            return
+        log.error("❌ No MANUAL_SESSION provided")
+        log.error("💡 Get PHPSESSID from browser and set as MANUAL_SESSION")
+        return
 
     log.info("🚀 Starting %s", BOT_NAME)
     log.info("📞 %s", BOT_TAGLINE)
     log.info("🌐 Monitoring: %s", BASE_URL)
-    log.info("⏰ Live OTPs only (10-minute window)")
     
-    if not check_session_health():
-        log.warning("⚠️ Session health check warning")
+    # Test API endpoint first
+    if not test_api_endpoint():
+        log.error("❌ API endpoint test failed. Please check configuration.")
+        log.error("💡 Possible solutions:")
+        log.error("   1. Get fresh PHPSESSID from browser")
+        log.error("   2. Check if API endpoint path is correct")
+        log.error("   3. Verify website is accessible")
+        return
+    
+    log.info("✅ API test passed! Starting OTP monitoring...")
     
     consecutive_failures = 0
     max_consecutive_failures = 5
@@ -510,20 +473,16 @@ def main_loop():
         try:
             result = fetch_sms(minutes_back=10)
             
-            if result in ["SESSION_EXPIRED", "NETWORK_ERROR", "ERROR"]:
+            if result in ["SESSION_EXPIRED", "ENDPOINT_ERROR", "NETWORK_ERROR", "ERROR"]:
                 consecutive_failures += 1
                 log.error("❌ Operation failed: %s (%d/%d)", 
                          result, consecutive_failures, max_consecutive_failures)
                 
                 if consecutive_failures >= max_consecutive_failures:
                     if result == "SESSION_EXPIRED":
-                        log.error("🔐 Session expired")
-                        # Try to re-login if credentials are available
-                        if os.getenv("NUMBERPANEL_USERNAME"):
-                            log.info("🔄 Attempting auto-relogin...")
-                            if numberpanel_login():
-                                consecutive_failures = 0
-                                continue
+                        log.error("🔐 Session expired - get new PHPSESSID")
+                    elif result == "ENDPOINT_ERROR":
+                        log.error("🔧 API endpoint issue - check configuration")
                     log.error("💤 Waiting 5 minutes...")
                     time.sleep(300)
                     consecutive_failures = 0
