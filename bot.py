@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IMS SMS Forwarder - MANUAL SESSION VERSION
-Uses manual session cookie since login flow is problematic
+IMS SMS Forwarder - FINAL WORKING VERSION
+Fixed file saving and data filtering
 """
 
 import os
 import time
 import json
-import tempfile
 import logging
 import re
 from hashlib import sha1
@@ -30,11 +29,10 @@ CHAT_IDS = [c.strip() for c in CHAT_IDS_RAW.split(",") if c.strip()]
 MANUAL_SESSION = os.getenv("MANUAL_SESSION") or os.getenv("PHPSESSID")
 
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "15"))
-STATE_FILE = os.getenv("STATE_FILE", "seen_imssms.json")
 
 # --- logging ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-log = logging.getLogger("imssms-manual")
+log = logging.getLogger("imssms-final")
 
 # --- session ---
 session = requests.Session()
@@ -50,27 +48,10 @@ if MANUAL_SESSION:
 
 # regex
 OTP_RE = re.compile(r"\b\d{3,8}\b")
+TIMESTAMP_RE = re.compile(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}')
 
-# --- seen storage ---
-def load_seen():
-    try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r") as f:
-                return set(json.load(f))
-    except Exception:
-        log.exception("Failed to load seen file")
-    return set()
-
-def save_seen(seen_set):
-    try:
-        fd, tmp = tempfile.mkstemp()
-        with os.fdopen(fd, "w") as f:
-            json.dump(list(seen_set), f)
-        os.replace(tmp, STATE_FILE)
-    except Exception:
-        log.exception("Failed to save seen file")
-
-seen = load_seen()
+# In-memory seen storage (Heroku has ephemeral filesystem)
+seen_messages = set()
 
 # --- Telegram send ---
 def send_telegram(msg: str):
@@ -83,6 +64,8 @@ def send_telegram(msg: str):
             resp = requests.post(url, data={"chat_id": cid, "text": msg, "parse_mode": "Markdown"}, timeout=10)
             if resp.status_code != 200:
                 log.warning("Telegram send failure %s: %s", resp.status_code, resp.text[:200])
+            else:
+                log.info("✅ Telegram message sent successfully")
         except Exception as e:
             log.warning("Telegram send exception: %s", e)
 
@@ -162,48 +145,47 @@ def fetch_sms(minutes_back=15):
             "Pragma": "no-cache",
         }
 
-        log.info("Fetching SMS data")
+        log.info("📡 Fetching SMS data from last %d minutes", minutes_back)
         r = session.get(DATA_URL, params=params, headers=headers, timeout=20)
         
-        log.info("Fetch status: %d", r.status_code)
-        log.info("Content-Type: %s", r.headers.get("Content-Type"))
+        log.info("📊 Fetch status: %d", r.status_code)
         
         if r.status_code != 200:
-            log.warning("Fetch failed with status: %d", r.status_code)
+            log.warning("❌ Fetch failed with status: %d", r.status_code)
             return "SESSION_EXPIRED"
             
-        # Check response content
-        content = r.text.strip()
-        
         # Parse JSON response
         try:
             data = r.json()
             if isinstance(data, dict) and "aaData" in data:
-                log.info("✅ SUCCESS! Got %d SMS records", len(data["aaData"]))
-                return data["aaData"]
+                # Filter out footer rows and invalid data
+                valid_sms = []
+                for row in data["aaData"]:
+                    if (isinstance(row, list) and len(row) >= 5 and 
+                        isinstance(row[0], str) and TIMESTAMP_RE.match(row[0]) and
+                        isinstance(row[2], str) and len(row[2]) > 5):  # Valid phone number
+                        valid_sms.append(row)
+                    else:
+                        log.debug("Skipping invalid row: %s", row)
+                
+                log.info("✅ SUCCESS! Got %d valid SMS records", len(valid_sms))
+                return valid_sms
             else:
-                log.info("Got JSON response but no aaData")
-                return data if isinstance(data, list) else []
+                log.warning("Unexpected JSON structure: %s", list(data.keys()) if isinstance(data, dict) else type(data))
+                return []
         except json.JSONDecodeError as e:
-            log.error("JSON parse failed: %s", e)
+            log.error("❌ JSON parse failed: %s", e)
             # Check if we got HTML instead
-            if content.startswith('<!DOCTYPE html>') or content.startswith('<html'):
-                log.error("Got HTML instead of JSON - session expired")
+            if r.text.strip().startswith('<!DOCTYPE html>') or r.text.strip().startswith('<html'):
+                log.error("🔐 Got HTML instead of JSON - session expired")
                 return "SESSION_EXPIRED"
             return []
             
     except Exception as e:
-        log.exception("Fetch exception: %s", e)
+        log.exception("💥 Fetch exception: %s", e)
         return "SESSION_EXPIRED"
 
-# --- Forwarding ---
-def already_seen_id(mid):
-    return mid in seen
-
-def mark_seen_id(mid, payload=None):
-    seen.add(mid)
-    save_seen(seen)
-
+# --- Forwarding with proper filtering ---
 def format_and_forward(row):
     try:
         ts = row[0] if len(row) > 0 else ""
@@ -211,56 +193,77 @@ def format_and_forward(row):
         number = row[2] if len(row) > 2 else ""
         service = row[3] if len(row) > 3 else ""
         message = row[4] if len(row) > 4 else ""
-    except Exception:
-        log.warning("Malformed row: %s", row)
+        
+        # Skip if essential data is missing
+        if not ts or not number or not message:
+            log.debug("Skipping row with missing data: %s", row)
+            return
+            
+        # Skip footer rows and invalid data
+        if not TIMESTAMP_RE.match(ts) or len(number) < 5:
+            log.debug("Skipping invalid row: %s", row)
+            return
+            
+    except Exception as e:
+        log.warning("Malformed row: %s - %s", row, e)
         return
 
-    mid = sha1(f"{ts}|{number}|{message}".encode()).hexdigest()
-    if already_seen_id(mid):
+    # Create unique ID for deduplication
+    message_id = sha1(f"{ts}|{number}|{message}".encode()).hexdigest()
+    
+    if message_id in seen_messages:
+        log.debug("Skipping duplicate message: %s", number)
         return
-
+        
+    # Extract OTP from message
     otps = OTP_RE.findall(message or "")
     otp = otps[-1] if otps else "N/A"
+    
+    # Format Telegram message
     text = (
-        f"✅ *New OTP*\n"
-        f"🌐 {BASE_URL}\n"
-        f"🕰 {ts}\n"
-        f"📞 {number}\n"
-        f"🔢 OTP: `{otp}`\n"
-        f"📡 {operator}\n"
-        f"💬 {message}"
+        f"✅ *New OTP Received* ✅\n\n"
+        f"🕰 *Time:* `{ts}`\n"
+        f"📞 *Number:* `{number}`\n"
+        f"🔢 *OTP Code:* `{otp}`\n"
+        f"🌍 *Operator:* {operator}\n"
+        f"📱 *Service:* {service}\n\n"
+        f"💬 *Message:*\n`{message}`\n\n"
+        f"🔗 *Source:* {BASE_URL}"
     )
+    
     send_telegram(text)
-    mark_seen_id(mid)
-    log.info("📤 Forwarded %s (%s)", number, otp)
+    seen_messages.add(message_id)
+    log.info("📤 Forwarded OTP from %s: %s", number, otp)
 
 # --- Main loop ---
 def main_loop():
     if not BOT_TOKEN or not CHAT_IDS:
-        log.error("Missing BOT_TOKEN or CHAT_IDS")
+        log.error("❌ Missing BOT_TOKEN or CHAT_IDS")
         return
         
     if not MANUAL_SESSION:
-        log.error("❌ MANUAL_SESSION not set. Please get PHPSESSID from browser and set as config var.")
+        log.error("❌ MANUAL_SESSION not set. Please get PHPSESSID from browser.")
+        log.error("💡 How to get: Login in browser → F12 → Application → Cookies → Copy PHPSESSID")
         return
 
-    log.info("🚀 Starting SMS polling with manual session")
+    log.info("🚀 Starting IMS SMS Forwarder")
+    log.info("📞 Monitoring for new OTP messages...")
     
     consecutive_failures = 0
     max_failures = 3
     
     while True:
         try:
-            result = fetch_sms(minutes_back=15)
+            result = fetch_sms(minutes_back=30)  # Increased to 30 minutes for better coverage
             
             if result == "SESSION_EXPIRED":
                 consecutive_failures += 1
-                log.error("Session expired (%d/%d)", consecutive_failures, max_failures)
+                log.error("🔐 Session expired (%d/%d)", consecutive_failures, max_failures)
                 
                 if consecutive_failures >= max_failures:
                     log.error("❌ Manual session expired. Please update MANUAL_SESSION config var.")
-                    # Keep trying but with longer delays
-                    time.sleep(300)
+                    log.error("💡 Get new PHPSESSID from browser and run: heroku config:set MANUAL_SESSION=new_value")
+                    time.sleep(300)  # Wait 5 minutes before retrying
                     consecutive_failures = 0
                 else:
                     time.sleep(60)
@@ -271,20 +274,26 @@ def main_loop():
             
             # Process SMS records
             if result and isinstance(result, list):
-                log.info("Processing %d SMS records", len(result))
+                valid_count = 0
                 for row in result:
                     if isinstance(row, list):
                         format_and_forward(row)
+                        valid_count += 1
+                
+                if valid_count > 0:
+                    log.info("📨 Processed %d new SMS messages", valid_count)
+                else:
+                    log.info("⏳ No new OTP messages found")
             else:
-                log.info("No new SMS records")
+                log.info("⏳ No SMS data received")
             
             time.sleep(POLL_INTERVAL)
                 
         except KeyboardInterrupt:
-            log.info("Interrupted by user")
+            log.info("⏹️ Interrupted by user")
             break
         except Exception:
-            log.exception("Main loop error - restarting in 30s")
+            log.exception("💥 Main loop error - restarting in 30s")
             time.sleep(30)
 
 if __name__ == "__main__":
