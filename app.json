@@ -1,8 +1,8 @@
 {
-  "name": "OTP Sentinel",
-  "description": "🛡️ Your Guardian for Verification Codes - Forward OTP messages from IMS SMS to Telegram",
-  "repository": "https://github.com/your-username/otp-sentinel",
-  "logo": "https://raw.githubusercontent.com/your-username/otp-sentinel/main/assets/logo.png",
+  "name": "NumberPanel Sentinel",
+  "description": "🛡️ Secure OTP forwarding from NumberPanel to Telegram with live filtering and country flags",
+  "repository": "https://github.com/your-username/numberpanel-sentinel",
+  "logo": "https://raw.githubusercontent.com/your-username/numberpanel-sentinel/main/assets/logo.png",
   "keywords": [
     "python",
     "telegram",
@@ -10,26 +10,36 @@
     "otp",
     "sms",
     "verification",
-    "security",
-    "automation"
+    "numberpanel",
+    "automation",
+    "security"
   ],
-  "website": "https://t.me/OTPSentinelBot",
+  "website": "https://t.me/NumberPanelBot",
+  "success_url": "/",
   "env": {
-    "IMSSMS_BOT_TOKEN": {
+    "BOT_TOKEN": {
       "description": "Your Telegram Bot Token from @BotFather",
       "required": true
     },
-    "IMSSMS_CHAT_IDS": {
+    "CHAT_IDS": {
       "description": "Comma separated list of Telegram Chat IDs to receive OTPs",
       "required": true
     },
     "MANUAL_SESSION": {
-      "description": "PHPSESSID cookie from IMS SMS website (get from browser after login)",
-      "required": true
+      "description": "PHPSESSID cookie from NumberPanel website (get from browser after login) - OR use auto login below",
+      "required": false
+    },
+    "NUMBERPANEL_USERNAME": {
+      "description": "Your NumberPanel username (for auto login - alternative to manual session)",
+      "required": false
+    },
+    "NUMBERPANEL_PASSWORD": {
+      "description": "Your NumberPanel password (for auto login)",
+      "required": false
     },
     "BASE_URL": {
-      "description": "IMS SMS base URL",
-      "value": "https://imssms.org",
+      "description": "NumberPanel base URL",
+      "value": "http://51.89.99.105/NumberPanel",
       "required": false
     },
     "POLL_INTERVAL": {
@@ -41,7 +51,7 @@
   "formation": {
     "worker": {
       "quantity": 1,
-      "size": "Basic"
+      "size": "eco"
     }
   },
   "buildpacks": [
@@ -49,9 +59,8 @@
       "url": "heroku/python"
     }
   ],
-  "addons": [
-    {
-      "plan": "heroku-redis:mini"
-    }
-  ]
+  "addons": [],
+  "scripts": {
+    "postdeploy": "echo 'NumberPanel Sentinel deployed successfully! Configure your environment variables.'"
+  }
 }
