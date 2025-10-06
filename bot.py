@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-IMS SMS Forwarder - FINAL WORKING VERSION
-Fixed file saving and data filtering
+IMS SMS Forwarder - COMPLETE WORKING VERSION
+Forwards OTP messages from IMS SMS to Telegram
 """
 
 import os
@@ -31,8 +31,12 @@ MANUAL_SESSION = os.getenv("MANUAL_SESSION") or os.getenv("PHPSESSID")
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "15"))
 
 # --- logging ---
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-log = logging.getLogger("imssms-final")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+log = logging.getLogger("imssms-bot")
 
 # --- session ---
 session = requests.Session()
@@ -46,31 +50,67 @@ if MANUAL_SESSION:
     session.cookies.set("PHPSESSID", MANUAL_SESSION)
     log.info("Using manual session cookie: %s...", MANUAL_SESSION[:20])
 
-# regex
-OTP_RE = re.compile(r"\b\d{3,8}\b")
-TIMESTAMP_RE = re.compile(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}')
+# OTP regex patterns (ordered by priority)
+OTP_PATTERNS = [
+    r'\b\d{3}-\d{3}\b',      # 295-055 (most common)
+    r'\b\d{6}\b',            # 295055
+    r'\b\d{3}\s\d{3}\b',     # 295 055
+    r'\b\d{3,8}\b',          # fallback: any 3-8 digit number
+]
 
 # In-memory seen storage (Heroku has ephemeral filesystem)
 seen_messages = set()
 
 # --- Telegram send ---
 def send_telegram(msg: str):
+    """Send message to Telegram"""
     if not BOT_TOKEN or not CHAT_IDS:
         log.warning("Telegram token or chat ids missing; skipping send")
-        return
+        return False
+    
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    success = True
+    
     for cid in CHAT_IDS:
         try:
-            resp = requests.post(url, data={"chat_id": cid, "text": msg, "parse_mode": "Markdown"}, timeout=10)
+            resp = requests.post(
+                url, 
+                data={
+                    "chat_id": cid, 
+                    "text": msg, 
+                    "parse_mode": "Markdown",
+                    "disable_web_page_preview": True
+                }, 
+                timeout=10
+            )
             if resp.status_code != 200:
                 log.warning("Telegram send failure %s: %s", resp.status_code, resp.text[:200])
+                success = False
             else:
-                log.info("✅ Telegram message sent successfully")
+                log.debug("✅ Telegram message sent to chat %s", cid)
         except Exception as e:
             log.warning("Telegram send exception: %s", e)
+            success = False
+    
+    return success
 
-# --- Fetch SMS with manual session ---
-def fetch_sms(minutes_back=15):
+# --- Extract OTP from message ---
+def extract_otp(message: str) -> str:
+    """Extract OTP code from message using multiple patterns"""
+    if not message:
+        return "N/A"
+    
+    for pattern in OTP_PATTERNS:
+        matches = re.findall(pattern, message)
+        if matches:
+            # Return the last match (most likely the OTP)
+            return matches[-1]
+    
+    return "N/A"
+
+# --- Fetch SMS with comprehensive data detection ---
+def fetch_sms(minutes_back=60):
+    """Fetch SMS data from IMS SMS API"""
     try:
         now = datetime.now(timezone.utc)
         f1 = (now - timedelta(minutes=minutes_back)).strftime("%Y-%m-%d %H:%M:%S")
@@ -148,7 +188,7 @@ def fetch_sms(minutes_back=15):
         log.info("📡 Fetching SMS data from last %d minutes", minutes_back)
         r = session.get(DATA_URL, params=params, headers=headers, timeout=20)
         
-        log.info("📊 Fetch status: %d", r.status_code)
+        log.info("📊 API Response: %d %s", r.status_code, r.reason)
         
         if r.status_code != 200:
             log.warning("❌ Fetch failed with status: %d", r.status_code)
@@ -158,115 +198,177 @@ def fetch_sms(minutes_back=15):
         try:
             data = r.json()
             if isinstance(data, dict) and "aaData" in data:
-                # Filter out footer rows and invalid data
-                valid_sms = []
-                for row in data["aaData"]:
-                    if (isinstance(row, list) and len(row) >= 5 and 
-                        isinstance(row[0], str) and TIMESTAMP_RE.match(row[0]) and
-                        isinstance(row[2], str) and len(row[2]) > 5):  # Valid phone number
-                        valid_sms.append(row)
-                    else:
-                        log.debug("Skipping invalid row: %s", row)
+                raw_rows = len(data["aaData"])
+                log.info("📦 Received %d raw data rows", raw_rows)
                 
-                log.info("✅ SUCCESS! Got %d valid SMS records", len(valid_sms))
+                # Filter valid SMS rows
+                valid_sms = []
+                for i, row in enumerate(data["aaData"]):
+                    if isinstance(row, list) and len(row) >= 5:
+                        timestamp = str(row[0]) if len(row) > 0 else ""
+                        number = str(row[2]) if len(row) > 2 else ""
+                        message = str(row[4]) if len(row) > 4 else ""
+                        
+                        # Skip footer rows and invalid data
+                        if (number and not number.startswith("0,0,0") and 
+                            message and len(number) >= 3):
+                            valid_sms.append(row)
+                        else:
+                            log.debug("Skipping invalid row %d: %s", i, row[:3])
+                    else:
+                        log.debug("Skipping malformed row %d: %s", i, row)
+                
+                log.info("✅ Found %d valid SMS records", len(valid_sms))
+                
+                # Log sample for debugging
+                if valid_sms:
+                    sample = valid_sms[0]
+                    log.info("📝 Sample: %s | %s | %s", 
+                            sample[0] if len(sample) > 0 else "N/A",
+                            sample[2] if len(sample) > 2 else "N/A", 
+                            (sample[4][:80] + "...") if len(sample) > 4 and len(sample[4]) > 80 else 
+                            sample[4] if len(sample) > 4 else "N/A")
+                
                 return valid_sms
             else:
-                log.warning("Unexpected JSON structure: %s", list(data.keys()) if isinstance(data, dict) else type(data))
+                log.warning("Unexpected JSON structure in response")
                 return []
+                
         except json.JSONDecodeError as e:
             log.error("❌ JSON parse failed: %s", e)
-            # Check if we got HTML instead
-            if r.text.strip().startswith('<!DOCTYPE html>') or r.text.strip().startswith('<html'):
-                log.error("🔐 Got HTML instead of JSON - session expired")
+            # Check if we got HTML instead (session expired)
+            if r.text.strip().startswith(('<!DOCTYPE html>', '<html')):
+                log.error("🔐 Session expired - got HTML login page")
                 return "SESSION_EXPIRED"
+            log.debug("Raw response: %s", r.text[:500])
             return []
             
+    except requests.exceptions.RequestException as e:
+        log.error("🌐 Network error: %s", e)
+        return "NETWORK_ERROR"
     except Exception as e:
-        log.exception("💥 Fetch exception: %s", e)
-        return "SESSION_EXPIRED"
+        log.exception("💥 Unexpected error in fetch_sms: %s", e)
+        return "ERROR"
 
-# --- Forwarding with proper filtering ---
-def format_and_forward(row):
+# --- Process and forward SMS ---
+def process_sms(row):
+    """Process a single SMS row and forward to Telegram"""
     try:
-        ts = row[0] if len(row) > 0 else ""
-        operator = row[1] if len(row) > 1 else ""
-        number = row[2] if len(row) > 2 else ""
-        service = row[3] if len(row) > 3 else ""
-        message = row[4] if len(row) > 4 else ""
+        # Extract data from row
+        ts = str(row[0]) if len(row) > 0 else "Unknown"
+        operator = str(row[1]) if len(row) > 1 else "Unknown"
+        number = str(row[2]) if len(row) > 2 else "Unknown"
+        service = str(row[3]) if len(row) > 3 else "Unknown"
+        message = str(row[4]) if len(row) > 4 else ""
         
-        # Skip if essential data is missing
-        if not ts or not number or not message:
-            log.debug("Skipping row with missing data: %s", row)
-            return
-            
-        # Skip footer rows and invalid data
-        if not TIMESTAMP_RE.match(ts) or len(number) < 5:
-            log.debug("Skipping invalid row: %s", row)
-            return
+        # Validate essential fields
+        if not number or number.startswith("0,0,0") or not message:
+            log.debug("Skipping invalid SMS row")
+            return False
             
     except Exception as e:
-        log.warning("Malformed row: %s - %s", row, e)
-        return
+        log.warning("Failed to parse SMS row: %s - %s", row, e)
+        return False
 
-    # Create unique ID for deduplication
+    # Create unique message ID for deduplication
     message_id = sha1(f"{ts}|{number}|{message}".encode()).hexdigest()
     
+    # Check for duplicates
     if message_id in seen_messages:
-        log.debug("Skipping duplicate message: %s", number)
-        return
+        log.debug("Skipping duplicate message from %s", number)
+        return False
         
-    # Extract OTP from message
-    otps = OTP_RE.findall(message or "")
-    otp = otps[-1] if otps else "N/A"
+    # Extract OTP code
+    otp_code = extract_otp(message)
     
     # Format Telegram message
-    text = (
+    telegram_msg = (
         f"✅ *New OTP Received* ✅\n\n"
         f"🕰 *Time:* `{ts}`\n"
         f"📞 *Number:* `{number}`\n"
-        f"🔢 *OTP Code:* `{otp}`\n"
+        f"🔢 *OTP Code:* `{otp_code}`\n"
         f"🌍 *Operator:* {operator}\n"
         f"📱 *Service:* {service}\n\n"
         f"💬 *Message:*\n`{message}`\n\n"
         f"🔗 *Source:* {BASE_URL}"
     )
     
-    send_telegram(text)
-    seen_messages.add(message_id)
-    log.info("📤 Forwarded OTP from %s: %s", number, otp)
+    # Send to Telegram
+    if send_telegram(telegram_msg):
+        seen_messages.add(message_id)
+        log.info("📤 Forwarded OTP from %s: %s", number, otp_code)
+        return True
+    else:
+        log.error("❌ Failed to send Telegram message for %s", number)
+        return False
+
+# --- Health check and session validation ---
+def check_session_health():
+    """Check if the current session is still valid"""
+    try:
+        test_params = {
+            "fdate1": "2025-01-01 00:00:00",
+            "fdate2": "2025-01-01 00:01:00",
+            "sEcho": "1",
+            "iDisplayStart": "0",
+            "iDisplayLength": "1",
+            "_": str(int(time.time() * 1000)),
+        }
+        
+        r = session.get(DATA_URL, params=test_params, timeout=10)
+        return r.status_code == 200 and "aaData" in r.json()
+    except:
+        return False
 
 # --- Main loop ---
 def main_loop():
+    """Main application loop"""
+    # Validate configuration
     if not BOT_TOKEN or not CHAT_IDS:
-        log.error("❌ Missing BOT_TOKEN or CHAT_IDS")
+        log.error("❌ Missing required configuration: BOT_TOKEN or CHAT_IDS")
         return
         
     if not MANUAL_SESSION:
-        log.error("❌ MANUAL_SESSION not set. Please get PHPSESSID from browser.")
-        log.error("💡 How to get: Login in browser → F12 → Application → Cookies → Copy PHPSESSID")
+        log.error("❌ MANUAL_SESSION not configured")
+        log.error("💡 How to setup:")
+        log.error("1. Login to %s in your browser", BASE_URL)
+        log.error("2. Press F12 → Application → Cookies → Copy PHPSESSID value")
+        log.error("3. Run: heroku config:set MANUAL_SESSION=your_phpsessid_value")
         return
 
     log.info("🚀 Starting IMS SMS Forwarder")
-    log.info("📞 Monitoring for new OTP messages...")
+    log.info("📞 Monitoring for OTP messages...")
+    log.info("⏰ Polling interval: %d seconds", POLL_INTERVAL)
+    log.info("👥 Telegram chats: %s", CHAT_IDS)
+    
+    # Initial session health check
+    if not check_session_health():
+        log.warning("⚠️ Initial session health check failed - proceeding anyway")
     
     consecutive_failures = 0
-    max_failures = 3
+    max_consecutive_failures = 5
     
     while True:
         try:
-            result = fetch_sms(minutes_back=30)  # Increased to 30 minutes for better coverage
+            # Fetch SMS data
+            result = fetch_sms(minutes_back=60)
             
-            if result == "SESSION_EXPIRED":
+            # Handle different result types
+            if result in ["SESSION_EXPIRED", "NETWORK_ERROR", "ERROR"]:
                 consecutive_failures += 1
-                log.error("🔐 Session expired (%d/%d)", consecutive_failures, max_failures)
+                log.error("❌ Operation failed: %s (%d/%d)", 
+                         result, consecutive_failures, max_consecutive_failures)
                 
-                if consecutive_failures >= max_failures:
-                    log.error("❌ Manual session expired. Please update MANUAL_SESSION config var.")
-                    log.error("💡 Get new PHPSESSID from browser and run: heroku config:set MANUAL_SESSION=new_value")
-                    time.sleep(300)  # Wait 5 minutes before retrying
+                if consecutive_failures >= max_consecutive_failures:
+                    if result == "SESSION_EXPIRED":
+                        log.error("🔐 Session expired. Please update MANUAL_SESSION:")
+                        log.error("1. Login to %s in browser", BASE_URL)
+                        log.error("2. Get new PHPSESSID from Developer Tools")
+                        log.error("3. Run: heroku config:set MANUAL_SESSION=new_value")
+                    time.sleep(300)  # Wait 5 minutes
                     consecutive_failures = 0
                 else:
-                    time.sleep(60)
+                    time.sleep(60)  # Wait 1 minute
                 continue
                 
             # Reset failure counter on success
@@ -274,26 +376,27 @@ def main_loop():
             
             # Process SMS records
             if result and isinstance(result, list):
-                valid_count = 0
-                for row in result:
-                    if isinstance(row, list):
-                        format_and_forward(row)
-                        valid_count += 1
+                processed_count = 0
+                for sms_row in result:
+                    if process_sms(sms_row):
+                        processed_count += 1
                 
-                if valid_count > 0:
-                    log.info("📨 Processed %d new SMS messages", valid_count)
+                if processed_count > 0:
+                    log.info("📨 Successfully processed %d new OTP messages", processed_count)
                 else:
-                    log.info("⏳ No new OTP messages found")
+                    log.info("⏳ No new OTP messages found in this check")
             else:
-                log.info("⏳ No SMS data received")
+                log.info("⏳ No SMS data to process")
             
+            # Wait for next poll
             time.sleep(POLL_INTERVAL)
                 
         except KeyboardInterrupt:
-            log.info("⏹️ Interrupted by user")
+            log.info("⏹️ Application stopped by user")
             break
-        except Exception:
-            log.exception("💥 Main loop error - restarting in 30s")
+        except Exception as e:
+            log.exception("💥 Unexpected error in main loop: %s", e)
+            log.info("🔄 Restarting in 30 seconds...")
             time.sleep(30)
 
 if __name__ == "__main__":
