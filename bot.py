@@ -1,177 +1,132 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-NumberPanel Debug Bot - Find Correct API Endpoint
+NumberPanel OTP Bot
+Mode: ONLY LATEST (NEW ONE) OTP
+Website: http://51.89.99.105/NumberPanel
 """
 
 import os
 import time
 import json
-import logging
+import re
 import requests
-from datetime import datetime, timezone, timedelta
-from urllib.parse import urljoin
+from datetime import datetime
 
-# --- config ---
+# ================= CONFIG =================
 BASE_URL = os.getenv("BASE_URL", "http://51.89.99.105/NumberPanel").rstrip("/")
-MANUAL_SESSION = os.getenv("MANUAL_SESSION", "2u73o492t4cr7d5tbkbcj63dv7")
+API_PATH = "/client/res/data_smscdr.php"
 
-# --- logging ---
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-log = logging.getLogger("debug-bot")
+PHPSESSID = os.getenv("PHPSESSID", "PUT_YOUR_PHPSESSID_HERE")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "PUT_TELEGRAM_BOT_TOKEN_HERE")
+CHAT_IDS = os.getenv("CHAT_IDS", "-1001234567890").split(",")
 
-# --- session ---
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "10"))
+STATE_FILE = "last_seen.json"
+
+# ================= HEADERS =================
+HEADERS = {
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "X-Requested-With": "XMLHttpRequest",
+    "User-Agent": "Mozilla/5.0",
+    "Referer": f"{BASE_URL}/client/SMSDashboard",
+}
+
+# ================= SESSION =================
 session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-})
+session.cookies.set("PHPSESSID", PHPSESSID)
 
-if MANUAL_SESSION:
-    session.cookies.set("PHPSESSID", MANUAL_SESSION)
-    log.info("Using session: %s...", MANUAL_SESSION[:20])
-
-def test_dashboard():
-    """Test if we can access the dashboard"""
-    try:
-        url = urljoin(BASE_URL, "/client/SMSDashboard")
-        log.info("🔍 Testing dashboard: %s", url)
-        r = session.get(url, timeout=10)
-        log.info("📊 Dashboard status: %d", r.status_code)
-        
-        if r.status_code == 200:
-            if "login" in r.text.lower():
-                log.error("❌ Got login page - session INVALID")
-                return False
-            else:
-                log.info("✅ Dashboard accessible")
-                return True
-        else:
-            log.error("❌ Dashboard failed: %d", r.status_code)
-            return False
-    except Exception as e:
-        log.error("💥 Dashboard test error: %s", e)
-        return False
-
-def test_api_endpoints():
-    """Test multiple possible API endpoints"""
-    endpoints = [
-        "/client/res/data_smscdr.php",  # Original
-        "/data_smscdr.php",             # Alternative 1
-        "/res/data_smscdr.php",         # Alternative 2  
-        "/ajax/data_smscdr.php",        # Alternative 3
-        "/api/data_smscdr.php",         # Alternative 4
-        "/client/ajax/data_smscdr.php", # Alternative 5
-    ]
-    
-    test_params = {
-        "fdate1": "2025-10-06 00:00:00",
-        "fdate2": "2025-10-06 23:59:59",
-        "sEcho": "1",
-        "iDisplayStart": "0", 
-        "iDisplayLength": "5",
-        "_": str(int(time.time() * 1000)),
-    }
-    
-    headers = {
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": urljoin(BASE_URL, "/client/SMSDashboard"),
-    }
-    
-    working_endpoints = []
-    
-    for endpoint in endpoints:
+# ================= HELPERS =================
+def load_last_seen():
+    if os.path.exists(STATE_FILE):
         try:
-            url = urljoin(BASE_URL, endpoint)
-            log.info("🔍 Testing: %s", url)
-            r = session.get(url, params=test_params, headers=headers, timeout=10)
-            
-            if r.status_code == 200:
-                try:
-                    data = r.json()
-                    log.info("✅ WORKING: %s (got JSON: %s)", endpoint, list(data.keys()) if isinstance(data, dict) else type(data))
-                    working_endpoints.append(endpoint)
-                except json.JSONDecodeError:
-                    log.info("⚠️  Got 200 but not JSON: %s", endpoint)
-            else:
-                log.info("❌ Failed %d: %s", r.status_code, endpoint)
-                
-        except Exception as e:
-            log.error("💥 Error testing %s: %s", endpoint, e)
-    
-    return working_endpoints
+            return json.load(open(STATE_FILE))
+        except Exception:
+            return {}
+    return {}
 
-def check_session_validity():
-    """Check if session cookie is valid"""
+def save_last_seen(data):
+    json.dump(data, open(STATE_FILE, "w"))
+
+def extract_otp(text):
+    if not text:
+        return None
+    m = re.search(r"\b(\d{4,8})\b", text)
+    return m.group(1) if m else None
+
+def send_telegram(text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    for chat_id in CHAT_IDS:
+        payload = {
+            "chat_id": chat_id.strip(),
+            "text": text,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True
+        }
+        requests.post(url, json=payload, timeout=10)
+
+# ================= START =================
+print("🚀 NumberPanel OTP Bot Started")
+print("⚡ Mode: ONLY LATEST OTP")
+
+last_seen = load_last_seen()
+
+while True:
     try:
-        # Test login page access
-        login_url = urljoin(BASE_URL, "/login")
-        r = session.get(login_url, timeout=10)
-        
-        if "PHPSESSID" in session.cookies:
-            log.info("🍪 Session cookie: %s", session.cookies.get("PHPSESSID"))
-        else:
-            log.error("❌ No session cookie set")
-            
-        if r.status_code == 200:
-            if "login" in r.text.lower() and "password" in r.text.lower():
-                log.info("🔐 Can access login page")
-            else:
-                log.info("📄 Got page (might be redirected)")
-                
+        params = {
+            "fdate1": "2025-01-01 00:00:00",
+            "fdate2": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "iDisplayStart": 0,
+            "iDisplayLength": 1,  # 🔥 ONLY LATEST ROW
+            "sEcho": 1,
+            "_": int(time.time() * 1000),
+        }
+
+        r = session.get(
+            BASE_URL + API_PATH,
+            headers=HEADERS,
+            params=params,
+            timeout=10
+        )
+
+        if r.status_code != 200:
+            time.sleep(CHECK_INTERVAL)
+            continue
+
+        data = r.json()
+        rows = data.get("aaData", [])
+
+        if not rows:
+            time.sleep(CHECK_INTERVAL)
+            continue
+
+        # ✅ ONLY FIRST (LATEST) SMS
+        ts, pool, number, service, message = rows[0][:5]
+        key = f"{number}_{ts}"
+
+        if last_seen.get("last_key") == key:
+            time.sleep(CHECK_INTERVAL)
+            continue
+
+        otp = extract_otp(message)
+
+        if otp:
+            msg = (
+                f"🔐 *NEW OTP RECEIVED*\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"🕒 `{ts}`\n"
+                f"📞 `{number}`\n"
+                f"📲 `{service}`\n"
+                f"🔢 *OTP:* `{otp}`\n"
+            )
+            send_telegram(msg)
+
+        # 🔒 Mark as processed (even if OTP not found)
+        last_seen = {"last_key": key}
+        save_last_seen(last_seen)
+
     except Exception as e:
-        log.error("💥 Session check error: %s", e)
+        print("❌ Error:", e)
 
-def main():
-    log.info("🚀 NumberPanel Debug Bot Starting...")
-    log.info("🌐 Base URL: %s", BASE_URL)
-    log.info("🔑 Session: %s...", MANUAL_SESSION[:20])
-    
-    # Step 1: Check session validity
-    log.info("\n" + "="*50)
-    log.info("STEP 1: Checking session validity")
-    log.info("="*50)
-    check_session_validity()
-    
-    # Step 2: Test dashboard access
-    log.info("\n" + "="*50)
-    log.info("STEP 2: Testing dashboard access") 
-    log.info("="*50)
-    dashboard_ok = test_dashboard()
-    
-    if not dashboard_ok:
-        log.error("❌ CANNOT ACCESS DASHBOARD - Session likely expired")
-        log.error("💡 Get new PHPSESSID from browser")
-        return
-    
-    # Step 3: Test API endpoints
-    log.info("\n" + "="*50)
-    log.info("STEP 3: Testing API endpoints")
-    log.info("="*50)
-    working_endpoints = test_api_endpoints()
-    
-    # Step 4: Results
-    log.info("\n" + "="*50)
-    log.info("RESULTS")
-    log.info("="*50)
-    
-    if working_endpoints:
-        log.info("✅ WORKING ENDPOINTS:")
-        for endpoint in working_endpoints:
-            log.info("   - %s", endpoint)
-        log.info("💡 Update your DATA_API_PATH environment variable")
-    else:
-        log.error("❌ NO WORKING ENDPOINTS FOUND")
-        log.error("💡 Possible issues:")
-        log.error("   1. Session cookie expired")
-        log.error("   2. API endpoint is different")
-        log.error("   3. IP blocked by server")
-        log.error("   4. Website structure changed")
-    
-    log.info("\n🔧 NEXT STEPS:")
-    log.info("   1. Get fresh PHPSESSID from browser")
-    log.info("   2. Check Network tab for correct API call")
-    log.info("   3. Update environment variables")
-
-if __name__ == "__main__":
-    main()
+    time.sleep(CHECK_INTERVAL)
